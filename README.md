@@ -107,9 +107,6 @@ make up
 
 ---
 
-## 👥 Équipe et contacts
-- Encadrant : ...
-- Développeur : ...
 
 ---
 
