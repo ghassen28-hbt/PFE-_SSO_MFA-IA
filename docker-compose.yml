@@ -1,0 +1,126 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: pfe_postgres
+    environment:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: keycloak
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: pfe_clickhouse
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - ch_data:/var/lib/clickhouse
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    environment:
+      CLICKHOUSE_DB: iam
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: admin123
+
+  scoring-service:
+    build: ./ml/scoring-service
+    container_name: pfe_scoring_service
+    ports:
+      - "8090:8090"
+    volumes:
+      - ./ml/training:/training
+    restart: unless-stopped
+
+  event-collector:
+    build: ./services/event-collector
+    container_name: pfesso-event-collector-1
+    ports:
+      - "8088:8088"
+    environment:
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DB: iam
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: admin123
+      CLICKHOUSE_TABLE: login_events
+      ABUSEIPDB_API_KEY: ${ABUSEIPDB_API_KEY}
+      ABUSEIPDB_ENABLED: "true"
+      TOR_EXIT_FILE: /app/tor_exit_nodes.txt
+      GEOLITE2_ENABLED: "true"
+      GEOLITE2_DB_PATH: /app/data/GeoLite2-City.mmdb
+      SCORING_ENABLED: "true"
+      SCORING_URL: http://scoring-service:8090/score
+      SCORING_TIMEOUT: "5"
+    env_file:
+      - ./services/event-collector/.env
+    volumes:
+      - ./data/GeoLite2-City.mmdb:/app/data/GeoLite2-City.mmdb:ro
+    depends_on:
+      - clickhouse
+      - scoring-service
+
+  biometric-service:
+    build: ./services/biometric-service
+    container_name: pfe_biometric_service
+    ports:
+      - "8091:8091"
+    environment:
+      FACE_MODEL_NAME: buffalo_l
+      FACE_SIMILARITY_THRESHOLD: "0.45"
+      BIOMETRIC_DATA_DIR: /app/data
+      MIN_FACE_RATIO: "0.12"
+      MIN_BLUR_SCORE: "25.0"
+      MIN_BRIGHTNESS: "25.0"
+      MAX_BRIGHTNESS: "235.0"
+      FRONT_YAW_MAX: "0.08"
+      CHALLENGE_YAW_MIN: "0.10"
+      MIN_YAW_DELTA: "0.08"
+      MIN_CROSS_CAPTURE_SIM: "0.55"
+    volumes:
+      - ./services/biometric-service/data:/app/data
+      - ./services/biometric-service/models:/root/.insightface
+    restart: unless-stopped
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0.0
+    container_name: pfe_keycloak
+    command: start-dev
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: keycloak
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+      KC_HTTP_ENABLED: "true"
+      KC_HOSTNAME: "http://localhost:8081"
+      KC_HOSTNAME_STRICT: "false"
+      KC_PROXY_HEADERS: "xforwarded"
+      KC_SPI_EVENTS_LISTENER_RISK_EVENT_LISTENER_COLLECTOR_URL: "http://event-collector:8088/events"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./keycloak-spi/kc-event-listener/target:/opt/keycloak/providers:ro
+    depends_on:
+      - postgres
+      - event-collector
+
+  nginx:
+    image: nginx:latest
+    container_name: pfe_nginx
+    ports:
+      - "8081:80"
+    volumes:
+      - ./infra/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      keycloak:
+        condition: service_started
+
+volumes:
+  pgdata:
+  ch_data:

@@ -1,0 +1,766 @@
+================================================================================
+        CLICKHOUSE: IMPLÉMENTATION COMPLÈTE DES 35 NOUVELLES FEATURES
+        Documentation Technique - Schéma SQL, Calculs, Queries Avancées
+================================================================================
+
+TABLE DES MATIÈRES
+================================================================================
+1. Schéma SQL complet (86 colonnes)
+2. Détail des 35 nouvelles features
+3. Exemples de requêtes avancées
+4. Dashboards d'analyse
+5. Considérations de performance
+6. Roadmap d'implémentation
+
+
+================================================================================
+1. SCHÉMA SQL COMPLET (86 COLONNES)
+================================================================================
+
+CREATE TABLE iam.login_events_v2 (
+  -- ==== GROUPE 1: IDENTIFIANTS & CONTEXTE (8 colonnes) ====
+  event_time DateTime,
+  realm String,
+  client_id String,
+  user_id String,
+  username String,
+  event_type String,
+  error String,
+  session_id String,
+  
+  -- ==== GROUPE 2: IP & RÉSEAU (3 colonnes) ====
+  ip String,
+  is_public_ip UInt8,
+  
+  -- ==== GROUPE 3: USER-AGENT & DEVICE (6 colonnes) ====
+  ua_raw String,
+  ua_browser String,
+  ua_os String,
+  ua_device String,
+  device_fp String,
+  is_new_device UInt8,
+  
+  -- ==== GROUPE 4: TEMPOREL (7 colonnes) ====
+  hour UInt8,
+  day_of_week UInt8,
+  is_weekend UInt8,
+  is_night_login UInt8,
+  is_business_hours UInt8,
+  
+  -- ==== GROUPE 5: HISTORIQUES & CONTEXTE (6 colonnes) ====
+  fails_5m UInt32,
+  fails_1h UInt32,
+  fails_24h UInt32,
+  login_1h UInt32,
+  event_success UInt8,
+  app_sensitivity UInt8,
+  
+  -- ==== GROUPE 6: ABUSEIPDB (7 colonnes) ====
+  abuse_score UInt8,
+  ip_reports UInt32,
+  abuse_usage_type String,
+  abuse_isp String,
+  abuse_country_code String,
+  abuse_last_reported_at String,
+  
+  -- ==== GROUPE 7: TOR (1 colonne) ====
+  is_tor UInt8,
+  
+  -- ==== GROUPE 8: GREYNOISE (3 colonnes) ====
+  greynoise_noise UInt8,
+  greynoise_riot UInt8,
+  greynoise_classification String,
+  
+  -- ==== GROUPE 9: VIRUSTOTAL (3 colonnes) ====
+  vt_malicious UInt8,
+  vt_suspicious UInt8,
+  vt_reputation Int32,
+  
+  -- ==== GROUPE 10: GEOLITE2 (8 colonnes) ====
+  geo_country String,
+  geo_country_code String,
+  geo_city String,
+  geo_postal_code String,
+  geo_latitude Float32,
+  geo_longitude Float32,
+  geo_timezone String,
+  
+  -- ==== GROUPE 11: SCORING DE RISQUE (3 colonnes) ====
+  risk_score UInt8,
+  risk_reasons String,
+  step_up_required UInt8,
+  
+  -- ==== GROUPE 12: JSON ENRICHMENT (1 colonne) ====
+  ip_enrichment_json String,
+  
+  -- ===== NOUVELLES FEATURES: GROUPE 13 - CONTEXTE AVANCÉ (8 colonnes) =====
+  user_location_history String,            -- JSON array historique
+  is_impossible_travel UInt8,
+  distance_from_last_location_km Float32,
+  is_vpn_detected UInt8,
+  vpn_provider String,
+  is_proxy_detected UInt8,
+  proxy_provider String,
+  
+  -- ===== NOUVELLES FEATURES: GROUPE 14 - COMPORTEMENT (5 colonnes) =====
+  consecutive_failures UInt32,
+  time_since_last_successful_login_mins Int32,
+  is_account_dormant UInt8,
+  login_frequency_deviation Float32,
+  app_switching_count UInt8,
+  
+  -- ===== NOUVELLES FEATURES: GROUPE 15 - MACHINE LEARNING (4 colonnes) =====
+  ml_anomaly_score Float32,
+  ml_feature_importance_json String,
+  is_ml_high_confidence UInt8,
+  ml_model_version String,
+  
+  -- ===== NOUVELLES FEATURES: GROUPE 16 - MFA AVANCÉ (4 colonnes) =====
+  mfa_method_used String,
+  mfa_response_time_secs Int32,
+  mfa_success UInt8,
+  mfa_attempts_before_success UInt8,
+  
+  -- ===== NOUVELLES FEATURES: GROUPE 17 - SÉCURITÉ AVANCÉE (4 colonnes) =====
+  bot_score Float32,
+  is_credential_stuffing_attack UInt8,
+  is_account_takeover_suspected UInt8,
+  is_session_hijacking_suspected UInt8,
+  
+  -- ===== NOUVELLES FEATURES: GROUPE 18 - PRÉDICTIF (2 colonnes) =====
+  risk_trend String,
+  predicted_risk_next_login Float32,
+  
+  -- ===== NOUVELLES FEATURES: GROUPE 19 - CONFORMITÉ (3 colonnes) =====
+  regulatory_classification String,
+  breach_flag UInt8,
+  access_from_restricted_country UInt8,
+  
+  -- ===== NOUVELLES FEATURES: GROUPE 20 - INTÉGRATION EXTERNE (3 colonnes) =====
+  siem_alert_id String,
+  external_threat_feed_match String,
+  darknet_market_mention UInt8
+
+) ENGINE = MergeTree()
+ORDER BY (event_time, user_id, realm)
+PARTITION BY toDate(event_time)
+CODEC(LZ4);
+
+
+TOTAL: 51 colonnes actuelles + 35 nouvelles = 86 colonnes
+
+
+================================================================================
+2. DÉTAIL DES 35 NOUVELLES FEATURES
+================================================================================
+
+2.1 GROUPE 13: CONTEXTE AVANCÉ (8 colonnes) [52-58]
+════════════════════════════════════════════════════
+
+[52] user_location_history (String - JSON Array)
+     ├─ Historique des 10 dernières localisations
+     ├─ Format JSON:
+     │  [
+     │    {"country": "TH", "city": "Bangkok", "lat": 13.7442, "lon": 100.4608, "timestamp": "2026-03-10T14:00:00"},
+     │    {"country": "US", "city": "NYC", "lat": 40.7128, "lon": -74.0060, "timestamp": "2026-03-05T22:00:00"}
+     │  ]
+     ├─ Calcul: Append sur chaque LOGIN success
+     └─ Utilité: Détecter impossible travel patterns
+
+[53] is_impossible_travel (UInt8)
+     ├─ Détection: distance / (time_diff_hours * 900) > 1
+     ├─ 900 km/h = vitesse avion commercial max
+     ├─ Risk scoring: +50 points
+     └─ Alerte automatique si detecté
+
+[54] distance_from_last_location_km (Float32)
+     ├─ Calcul: Haversine formula
+     ├─ Risk scoring:
+     │  ├─ > 5000 km: +15 points
+     │  ├─ 1000-5000 km: +5 points
+     │  └─ < 100 km: 0 points
+     └─ Utilité: Gradation du risque géographique
+
+[55] is_vpn_detected (UInt8)
+     ├─ Source: IPQualityScore API
+     ├─ VPN = tunnel chiffré masquant IP réelle
+     ├─ Risk scoring: 
+     │  ├─ VPN unknown: +15 points
+     │  ├─ VPN corporate (trusted): 0 points
+     └─ Whitelist: Cisco, CheckPoint, Palo Alto
+
+[56] vpn_provider (String)
+     ├─ Classification du VPN utilisé
+     ├─ Exemples: "NordVPN", "ExpressVPN", "Cisco AnyConnect"
+     └─ Utilité: Histogramme par provider
+
+[57] is_proxy_detected (UInt8)
+     ├─ Distinct de VPN - visible intermediary
+     ├─ Sources: Datacenter IPs, Squid, residential proxies
+     ├─ Risk scoring: +20 points
+     └─ Indicateur: BOTs/automated attacks
+
+[58] proxy_provider (String)
+     ├─ Exemples: "Bright Data", "Luminati", "AWS Datacenter"
+     ├─ High risk: Residential proxies
+     └─ Utilité: Filtrer par provider
+
+
+2.2 GROUPE 14: COMPORTEMENT & ANOMALIES (5 colonnes) [59-63]
+═════════════════════════════════════════════════════════
+
+[59] consecutive_failures (UInt32)
+     ├─ Nombre d'échecs d'affilée avant LOGIN réussi
+     ├─ Reset à 0 après succès
+     ├─ Risk scoring: +5 per failure (max +50)
+     └─ Alert: >= 10 consecutive = alarm
+
+[60] time_since_last_successful_login_mins (Int32)
+     ├─ -1 si jamais LOGIN antérieur
+     ├─ Utilité: Inactivité utilisateur
+     ├─ > 43200 minutes = dormant (30+ jours)
+     └─ Comparaison: comportement normal vs anormal
+
+[61] is_account_dormant (UInt8)
+     ├─ 1 si pas de LOGIN depuis 30+ jours
+     ├─ Risk scoring: +10 points si réactivé
+     └─ Alert: Dormant account avec high risk
+
+[62] login_frequency_deviation (Float32)
+     ├─ Standard deviation du pattern de login
+     ├─ -2σ = très infrequent (anormal)
+     ├─ 0 = normal patterns
+     ├─ +2σ = très fréquent (anormal)
+     ├─ Risk scoring: abs(deviation) > 2.5 = +15 points
+     └─ Détecte: Changements comportement utilisateur
+
+[63] app_switching_count (UInt8)
+     ├─ Nombre d'apps différentes en 1 heure
+     ├─ Risk scoring:
+     │  ├─ >= 3 apps: +3 points
+     │  ├─ >= 5 apps: +8 points
+     │  └─ >= 8 apps: +15 points (lateral movement)
+     └─ Détecte: Post-compromise lateral movement
+
+
+2.3 GROUPE 15: MACHINE LEARNING (4 colonnes) [64-67]
+════════════════════════════════════════════════════
+
+[64] ml_anomaly_score (Float32)
+     ├─ XGBoost/LightGBM prediction (0-1)
+     ├─ Features input: 30+ dimensions
+     ├─ Training: 90+ days historical data
+     ├─ Update: Weekly retraining
+     └─ Final score: 0.4*heuristic + 0.6*ml
+
+[65] ml_feature_importance_json (String)
+     ├─ JSON avec top 10 features
+     ├─ Format:
+     │  {
+     │    "top_features": [
+     │      {"feature": "is_tor", "importance": 0.25},
+     │      {"feature": "abuse_score", "importance": 0.18}
+     │    ]
+     │  }
+     └─ Utilité: Explainability (XAI)
+
+[66] is_ml_high_confidence (UInt8)
+     ├─ 1 si confidence > 95%
+     ├─ Fusion strategy:
+     │  ├─ HIGH confidence: 0.9*ml + 0.1*heuristic
+     │  └─ LOW confidence: 0.5*ml + 0.5*heuristic
+     └─ Permet ajustement dynamique
+
+[67] ml_model_version (String)
+     ├─ Version string ex: "v2.3.1"
+     ├─ Permet reproducibilité
+     └─ Rollback capability si mauvaise version
+
+
+2.4 GROUPE 16: MFA AVANCÉ (4 colonnes) [68-71]
+═══════════════════════════════════════════════
+
+[68] mfa_method_used (String)
+     ├─ Méthode utilisée si MFA required
+     ├─ Valeurs: "TOTP", "SMS", "EMAIL", "PUSH", "NONE"
+     ├─ Sécurité:
+     │  ├─ TOTP = très secure (offline)
+     │  ├─ SMS = medium (SIM swap risk)
+     │  └─ PUSH = user-friendly
+     └─ Audit: Quel facteur accepté
+
+[69] mfa_response_time_secs (Int32)
+     ├─ Temps entre challenge et réponse
+     ├─ Range: 0-600 secondes (timeout)
+     ├─ Interprétation:
+     │  ├─ < 5 sec: Bot automation (suspect)
+     │  ├─ 5-30 sec: Normal
+     │  ├─ > 300 sec: Très slow/Strange
+     └─ Risk scoring: < 5sec = +15 points
+
+[70] mfa_success (UInt8)
+     ├─ 0 = MFA failed, 1 = success
+     ├─ Utilité: Audit tentatives échouées
+     ├─ Risk scoring: MFA failed = +25 points
+     └─ Detect: Targeted MFA brute force
+
+[71] mfa_attempts_before_success (UInt8)
+     ├─ Nombre de tentatives avant bon code
+     ├─ 1 = succès immédiat (normal)
+     ├─ 3+ = plusieurs erreurs (suspect)
+     └─ Risk scoring: >= 3 = +10 points
+
+
+2.5 GROUPE 17: SÉCURITÉ AVANCÉE (4 colonnes) [72-75]
+════════════════════════════════════════════════════
+
+[72] bot_score (Float32)
+     ├─ 0-1 probability of bot
+     ├─ Sources: DataDome, Imperva, local analysis
+     ├─ Signals: Missing UA, headless browser, TOR+DC IP
+     ├─ Risk scoring: +30 points si > 0.9
+     └─ Utilité: Bloquer automated attacks
+
+[73] is_credential_stuffing_attack (UInt8)
+     ├─ Détection: Multiple usernames du même IP (10+ en 10 min)
+     ├─ Heuristic: COUNT(DISTINCT username) > 10 WITHIN 10 MINUTES
+     ├─ Risk scoring: +40 points
+     └─ Action: CAPTCHA force, IP block temporaire
+
+[74] is_account_takeover_suspected (UInt8)
+     ├─ Combinaison de signaux:
+     │  ├─ New device: +10
+     │  ├─ Impossible travel: +10
+     │  ├─ VPN + new device: +15
+     │  ├─ Password changed + new IP: +20
+     │  └─ Total >= 40 = suspect
+     ├─ Risk scoring: +50 points
+     └─ Action: Force password reset, alert
+
+[75] is_session_hijacking_suspected (UInt8)
+     ├─ Detection: Same session_id + different device_fp
+     ├─ Same user_id + different IP dans 10 secondes
+     ├─ Risk scoring: +60 points
+     └─ Action: Force logout, invalidate session
+
+
+2.6 GROUPE 18: PRÉDICTIF (2 colonnes) [76-77]
+═════════════════════════════════════════════
+
+[76] risk_trend (String)
+     ├─ Valeurs: "STABLE", "INCREASING", "DECREASING"
+     ├─ Calcul: Compare current vs avg_last_7d
+     ├─ if current > avg + 20%: "INCREASING"
+     ├─ elif current < avg - 20%: "DECREASING"
+     └─ Utilité: Tendances long-term par user
+
+[77] predicted_risk_next_login (Float32)
+     ├─ ML forecast pour prochaine login
+     ├─ Inputs: dernières 10 logins, heure, day of week
+     ├─ Accuracy: ~70-80%
+     └─ Utilité: Proactive security measures
+
+
+2.7 GROUPE 19: CONFORMITÉ & LÉGAL (3 colonnes) [78-80]
+═════════════════════════════════════════════════════
+
+[78] regulatory_classification (String)
+     ├─ Valeurs: "PCI-DSS", "HIPAA", "GDPR", "PII", "NONE"
+     ├─ Mapping par client_id:
+     │  ├─ finance-client-3 → PCI-DSS
+     │  ├─ healthcare-client → HIPAA
+     │  └─ portal-client-5 → GDPR
+     └─ Utilité: Audit trails compliance
+
+[79] breach_flag (UInt8)
+     ├─ Source: HIBP, known breach databases
+     ├─ 1 si IP impliquée dans breach
+     ├─ Risk scoring: +25 points
+     └─ Utilité: Extra vigilance
+
+[80] access_from_restricted_country (UInt8)
+     ├─ Connexion depuis pays blocklist
+     ├─ Configuration: BLOCKED, RESTRICTED par company
+     ├─ Risk scoring:
+     │  ├─ Blocklist: +100 (auto-reject)
+     │  └─ Restricted: +20
+     └─ Action: Auto-block ou force MFA
+
+
+2.8 GROUPE 20: INTÉGRATION EXTERNE (3 colonnes) [81-83]
+═══════════════════════════════════════════════════════
+
+[81] siem_alert_id (String)
+     ├─ Format: "{SIEM_NAME}:{ALERT_ID}"
+     ├─ Exemples: "SPLUNK:alert_12345", "ELASTIC:event_abc123"
+     ├─ Process:
+     │  1. Event ClickHouse trigger alert
+     │  2. SIEM crée incident
+     │  3. Store ID pour correlation
+     └─ Utilité: Cross-reference unified investigation
+
+[82] external_threat_feed_match (String)
+     ├─ JSON array de threat feeds matching
+     ├─ Sources: abuse.ch, malwaredomains, spamhaus
+     ├─ Format: ["source1", "source2", ...]
+     ├─ Risk scoring: +15 per match (max +50)
+     └─ Utilité: External threat intelligence
+
+[83] darknet_market_mention (UInt8)
+     ├─ Source: Paid threat intelligence feeds
+     ├─ 1 si IP spotted on darknet
+     ├─ Examples:
+     │  ├─ Known botnet C2
+     │  ├─ Carding marketplace
+     │  └─ Ransomware traces
+     ├─ Risk scoring: +50 points (très mauvais)
+     └─ Action: Immédiate block, law enforcement
+
+
+================================================================================
+3. EXEMPLES DE REQUÊTES AVANCÉES
+================================================================================
+
+# Query 1: Impossible Travel Detection (24h)
+SELECT 
+  event_time,
+  user_id,
+  username,
+  ip,
+  geo_country,
+  distance_from_last_location_km,
+  is_impossible_travel,
+  risk_score
+FROM login_events_v2
+WHERE is_impossible_travel = 1 
+  AND event_time >= NOW() - INTERVAL 24 HOUR
+ORDER BY event_time DESC;
+
+
+# Query 2: Account Takeover Candidates
+SELECT 
+  user_id,
+  username,
+  COUNT(*) as anomaly_count,
+  MAX(is_account_takeover_suspected) as suspected,
+  MAX(ml_anomaly_score) as ml_score,
+  MAX(risk_score) as max_risk
+FROM login_events_v2
+WHERE (is_impossible_travel = 1 OR is_new_device = 1)
+  AND event_time >= NOW() - INTERVAL 7 DAY
+GROUP BY user_id
+HAVING COUNT(*) >= 2
+ORDER BY ml_score DESC;
+
+
+# Query 3: Credential Stuffing Real-time
+SELECT 
+  event_time,
+  ip,
+  proxy_provider,
+  COUNT(DISTINCT username) as unique_users,
+  bot_score,
+  is_credential_stuffing_attack
+FROM login_events_v2
+WHERE event_type = 'LOGIN_ERROR'
+  AND event_time >= NOW() - INTERVAL 10 MINUTE
+GROUP BY ip
+HAVING COUNT(DISTINCT username) >= 5
+ORDER BY unique_users DESC;
+
+
+# Query 4: ML Anomaly Analysis
+SELECT 
+  user_id,
+  username,
+  ml_anomaly_score,
+  is_ml_high_confidence,
+  ml_feature_importance_json,
+  ml_model_version,
+  risk_score,
+  step_up_required
+FROM login_events_v2
+WHERE ml_anomaly_score > 0.75
+  AND event_time >= NOW() - INTERVAL 24 HOUR
+ORDER BY ml_anomaly_score DESC
+LIMIT 50;
+
+
+# Query 5: MFA Brute Force Detection
+SELECT 
+  user_id,
+  username,
+  COUNT(*) as mfa_attempts,
+  SUM(if(mfa_success = 0, 1, 0)) as failed,
+  AVG(mfa_response_time_secs) as avg_response,
+  GROUP_CONCAT(mfa_method_used) as methods_used
+FROM login_events_v2
+WHERE step_up_required = 1
+  AND event_time >= NOW() - INTERVAL 30 MINUTE
+GROUP BY user_id
+HAVING COUNT(*) >= 3
+ORDER BY failed DESC;
+
+
+# Query 6: Predictive Risk Forecast
+SELECT 
+  user_id,
+  username,
+  login_frequency_deviation,
+  risk_trend,
+  predicted_risk_next_login,
+  is_account_dormant,
+  time_since_last_successful_login_mins
+FROM login_events_v2
+WHERE risk_trend = 'INCREASING'
+  AND predicted_risk_next_login > 70
+ORDER BY predicted_risk_next_login DESC;
+
+
+# Query 7: VPN/Proxy Suspicious Activity
+SELECT 
+  event_time,
+  user_id,
+  ip,
+  is_vpn_detected,
+  vpn_provider,
+  is_proxy_detected,
+  proxy_provider,
+  abuse_score,
+  risk_score
+FROM login_events_v2
+WHERE (is_vpn_detected = 1 OR is_proxy_detected = 1)
+  AND vpn_provider NOT IN ('Cisco', 'CheckPoint', 'Palo Alto')
+  AND event_time >= NOW() - INTERVAL 24 HOUR
+ORDER BY risk_score DESC;
+
+
+# Query 8: Session Hijacking Suspects
+SELECT 
+  session_id,
+  user_id,
+  username,
+  is_session_hijacking_suspected,
+  device_fp,
+  ip,
+  mfa_success,
+  risk_score
+FROM login_events_v2
+WHERE is_session_hijacking_suspected = 1
+ORDER BY event_time DESC;
+
+
+# Query 9: Compliance Audit Trail (HIPAA/PCI-DSS)
+SELECT 
+  event_time,
+  username,
+  event_type,
+  ip,
+  regulatory_classification,
+  breach_flag,
+  access_from_restricted_country,
+  siem_alert_id,
+  risk_score
+FROM login_events_v2
+WHERE regulatory_classification IN ('HIPAA', 'PCI-DSS')
+  AND event_time >= NOW() - INTERVAL 30 DAY
+ORDER BY event_time DESC;
+
+
+# Query 10: Darknet & External Threat Feeds
+SELECT 
+  event_time,
+  ip,
+  user_id,
+  username,
+  darknet_market_mention,
+  external_threat_feed_match,
+  abuse_score,
+  risk_score
+FROM login_events_v2
+WHERE darknet_market_mention = 1 
+  OR external_threat_feed_match != '[]'
+ORDER BY risk_score DESC;
+
+
+================================================================================
+4. DASHBOARDS D'ANALYSE RECOMMANDÉS
+================================================================================
+
+DASHBOARD 1: REAL-TIME SECURITY OPERATIONS
+──────────────────────────────────────────
+
+Panel 1: Live Threat Events (Gauge)
+  SELECT COUNT(*) WHERE risk_score >= 60 AND event_time >= NOW() - INTERVAL 1 HOUR
+
+Panel 2: Account Takeover Alerts (Map)
+  Geo map avec is_account_takeover_suspected = 1
+
+Panel 3: Session Hijacking Attempts (Alert)
+  Any is_session_hijacking_suspected = 1
+
+Panel 4: MFA Challenges (Pie)
+  SELECT COUNT(*) GROUP BY mfa_method_used WHERE step_up_required = 1
+
+Panel 5: Bot Activity (Time Series)
+  Bot_score distribution par hour
+
+
+DASHBOARD 2: PREDICTIVE & MACHINE LEARNING
+───────────────────────────────────────────
+
+Panel 1: ML Anomaly Distribution
+  Histogram: ml_anomaly_score ranges
+
+Panel 2: Top Risk Drivers
+  Parse ml_feature_importance_json show top 10
+
+Panel 3: Prediction Accuracy
+  Compare predicted_risk_next_login vs actual_risk_score
+
+Panel 4: Model Version Adoption
+  Pie: % traffic by ml_model_version
+
+
+DASHBOARD 3: COMPLIANCE & REGULATORY
+────────────────────────────────────
+
+Panel 1: Events by Regulation
+  SELECT regulatory_classification, COUNT(*)
+
+Panel 2: Breach Flag Events
+  Alert table: breach_flag = 1
+
+Panel 3: Restricted Country Access
+  Bar chart: access_from_restricted_country
+
+Panel 4: SIEM Integration Health
+  Metric: % events with siem_alert_id
+
+
+================================================================================
+5. CONSIDÉRATIONS DE PERFORMANCE
+================================================================================
+
+INDEXATION OPTIMALE
+─────────────────
+
+PRIMARY:
+  ORDER BY (event_time, user_id, realm)
+
+PARTITIONING:
+  PARTITION BY toDate(event_time)
+
+SECONDARY INDEXES:
+  INDEX idx_user_id user_id TYPE set(100000)
+  INDEX idx_ip ip TYPE set(10000)
+  INDEX idx_risk_score risk_score TYPE minmax
+
+COMPRESSION:
+  abuse_isp CODEC(ZSTD)
+  ml_feature_importance_json CODEC(ZSTD)
+  external_threat_feed_match CODEC(ZSTD)
+  geo_country CODEC(LZ4)
+
+
+STORAGE ESTIMATIONS
+───────────────────
+
+Row size: ~7 KB (51 + 35 colonnes)
+Events/day (10k users): 50-200k
+Volume/day: 350 MB - 1.4 GB
+Volume/year: 130-500 GB (compressé)
+
+Indexes: +15-20%
+TOTAL ANNUEL: ~150-600 GB
+
+
+TTL STRATEGY
+────────────
+
+ALTER TABLE login_events_v2 MODIFY TTL event_time + INTERVAL 90 DAY;
+
+Archive avant suppression:
+  - Move to S3 ou autre storage
+  - Keep 7 jours hot, 30 jours warm, 90+ jours cold
+
+
+================================================================================
+6. ROADMAP D'IMPLÉMENTATION
+================================================================================
+
+PHASE 1: IMMÉDIAT (Semaine 1-2)
+────────────────────────────────
+
+✓ Créer table iam.login_events_v2 avec DDL 86 colonnes
+✓ Implémenter calculs des 35 features en Python
+✓ Tester insertion de 1000 events
+✓ Vérifier performance queries
+
+Tâches:
+  1. Setup ML model training pipeline (XGBoost)
+  2. Configure IPQualityScore API integration (VPN/Proxy detect)
+  3. Setup external threat feeds integration
+  4. Create initial dashboards
+
+
+PHASE 2: COURT-TERME (Semaine 3-4)
+──────────────────────────────────
+
+  - Fine-tune ML model (target > 85% accuracy)
+  - Integrate with SIEM (Splunk/ELK)
+  - Setup alerting rules pour ATO/session hijacking
+  - Implement prediction forecasting
+
+Métriques de succès:
+  - 95%+ ML predictions correct
+  - Alert response time < 5 minutes
+  - False positive rate < 5%
+
+
+PHASE 3: MOYEN-TERME (Month 2-3)
+────────────────────────────────
+
+  - Add graph database pour relationship analysis
+  - Behavioral fingerprinting models
+  - Real-time anomaly detection (stream processing)
+  - Automated incident response playbooks
+
+
+PHASE 4: LONG-TERME (Month 3+)
+──────────────────────────────
+
+  - Federated learning across multiple instances
+  - Advanced geofencing with ML
+  - Zero-trust architecture
+  - Compliance automation (PCI-DSS, HIPAA reporting)
+
+
+================================================================================
+CONCLUSION
+================================================================================
+
+Avec les 86 colonnes (51 + 35), le système:
+
+✓ Captures 360° du contexte d'authentification
+✓ Combine heuristiques + ML robustement
+✓ Détecte: ATO, session hijacking, credential stuffing, credential brute force
+✓ Support complet pour compliance (PCI-DSS, HIPAA, GDPR)
+✓ Forecasting et predictive analytics
+✓ Integration avec external systems (SIEM, threat feeds)
+
+Scalabilité:
+  - 50-200k events/day → 150-600 GB/year
+  - Sub-second queries (derniers 24h)
+  - Automatic TTL cleanup
+
+ROI Estimé:
+  - 50-80% reduction in successful account takeovers
+  - 90%+ faster incident detection
+  - Full compliance audit ready
+  - Real-time threat response capability
+
+
+================================================================================
+[FIN - CLICKHOUSE COMPLET 86 COLONNES]
+================================================================================

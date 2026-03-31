@@ -1,0 +1,6 @@
+pandas
+scikit-learn
+lightgbm
+clickhouse-connect
+joblib
+python-dotenv

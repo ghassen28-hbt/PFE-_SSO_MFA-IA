@@ -1,0 +1,1140 @@
+================================================================================
+    PROJET SSO + MFA + IA — SYSTÈME D'AUTHENTIFICATION ADAPTATIVE
+    Documentation Complète des Flux et Technologies
+    Projet de Fin d'Études (PFE)
+================================================================================
+
+TABLE DES MATIÈRES
+================================================================================
+1. Vue d'ensemble du projet
+2. Architecture générale
+3. Composants et technologies
+4. Flux d'authentification en détail
+5. Système de scoring IA et d'enrichissement
+6. Configuration Docker et déploiement
+7. Endpoints API
+8. Schémas de données
+9. Points critiques et sécurité
+
+
+================================================================================
+1. VUE D'ENSEMBLE DU PROJET
+================================================================================
+
+OBJECTIFS :
+-----------
+Ce projet implémente un système d'authentification avancé combinant :
+  • SSO (Single Sign-On) via Keycloak et OIDC
+  • MFA (Multi-Factor Authentication) adaptatif basé sur le risque
+  • IA adaptative avec scoring de risque d'anomalie 
+  • Détection d'activités suspectes en temps réel
+  • Enrichissement des événements via sources externes (AbuseIPDB, GeoLite2, etc.)
+  • Audit complet via ClickHouse
+
+CAS D'USAGE :
+-------------
+- Authentification centralisée pour une suite d'applications (HR, Finance, CRM, Portal, Admin)
+- Exiger MFA selon le niveau de risque détecté (connexion depuis pays inhabituel, nouvelle appareil, etc.)
+- Bloquer/alerter sur les tentatives suspectes
+- Conformité audit et traçabilité complète
+
+
+================================================================================
+2. ARCHITECTURE GÉNÉRALE
+================================================================================
+
+FLUX UTILISATEUR SIMPLIFIÉ :
+────────────────────────────
+
+    [Utilisateur/Client]
+           ↓ (HTTPS)
+    [Nginx - Reverse Proxy]
+           ↓ (proxy_pass)
+    [Keycloak - IdP/SSO] ←→ [PostgreSQL - DB Keycloak]
+           ↓ (Event Listener SPI)
+    [Event-Collector - FastAPI]
+           ↓ (Enrichissement IP)
+    [Enrichment Service]
+           ├─→ AbuseIPDB API
+           ├─→ GreyNoise API
+           ├─→ VirusTotal API
+           ├─→ GeoLite2 (local)
+           └─→ Tor Exit Nodes (bulk)
+           ↓
+    [ClickHouse - Data Warehouse]
+           ↓
+    [Dashboard Analyse/Alertes]
+
+
+MICROSERVICES :
+───────────────
+
+1. KEYCLOAK (Conteneur: pfe_keycloak)
+   - Serveur d'identité OIDC/OAuth2
+   - Fournit SSO pour toutes les applications
+   - Déclenche des événements (LOGIN, LOGIN_ERROR, REGISTER, MFA)
+   - Port: 8080 (interne), 8081 (public via Nginx)
+
+2. EVENT-COLLECTOR (Conteneur: pfesso-event-collector-1)
+   - Reçoit les événements Keycloak via SPI
+   - Enrichit les données (IP, géolocalisation, threat intel)
+   - Stocke dans ClickHouse
+   - Calcule le score de risque
+   - API FastAPI: http://localhost:8088
+
+3. CLICKHOUSE (Conteneur: pfe_clickhouse)
+   - Data warehouse columnaire
+   - Stocke les événements login_events avec toutes les features
+   - Excellente performance pour requêtes analytiques
+   - Port: 8123 (HTTP)
+
+4. NGINX (Conteneur: pfe_nginx)
+   - Reverse proxy pour Keycloak
+   - Force le header X-Forwarded-For pour récupérer l'IP réelle
+   - Écoute port 8081 (mapé vers port 80 du conteneur)
+
+5. POSTGRESQL (Conteneur: pfe_postgres)
+   - Base de données Keycloak
+   - Stocke utilisateurs, rôles, sessions
+   - Port: 5432
+
+APPLICATIONS CLIENTES (Répertoire /SP) :
+──────────────────────────────────────────
+  • admin/server.js       - Portail administrateur
+  • hr/server.js          - Application RH
+  • finance/server.js     - Application Finance
+  • crm/server.js         - Application CRM
+  • portal/server.js      - Portail utilisateur
+  • shared/oidc.js        - Library OIDC commune
+
+Chaque app utilise le même Keycloak pour authentification.
+
+
+================================================================================
+3. COMPOSANTS ET TECHNOLOGIES
+================================================================================
+
+3.1 KEYCLOAK (26.0.0, Quarkus)
+─────────────────────────────
+Rôle: Serveur d'identité OIDC/OAuth 2.0
+
+Configuration:
+  KC_PROXY: edge                      # Active la détection X-Forwarded-For
+  KC_DB: postgres                     # Base PostgreSQL
+  KC_HOSTNAME: http://localhost:8081  # URL publique
+  PFE_COLLECTOR_URL: http://event-collector:8088/events
+
+Événements décorés par le SPI RiskEventListenerProvider:
+  - Événement brut de Keycloak
+  - + IP client (extraite du header X-Forwarded-For si proxy)
+  - + User-Agent du client
+  - Envoyé au collector en JSON via HTTP POST
+
+
+3.2 EVENT-COLLECTOR (Python 3.11, FastAPI)
+──────────────────────────────────────────
+Rôle: Traitement des événements en temps réel
+
+Dépendances clés:
+  - fastapi/uvicorn  : Serveur web asynchrone
+  - requests         : Appels HTTP externes
+  - geoip2           : Géolocalisation (GeoLite2)
+  - user-agents      : Parsing User-Agent
+  - clickhouse-connect : Client ClickHouse
+
+Fonctionnalités:
+  1. Réception des événements Keycloak → /events (POST)
+  2. ExtractionIP réelle si proxy
+  3. Enrichissement multi-source:
+     - AbuseIPDB : repérages d'abus
+     - GeoLite2  : géolocalisation
+     - GreyNoise : détection bruit noiseux/RIOT
+     - Tor Project: détection nœud de sortie Tor
+     - VirusTotal: réputation
+     - HIBP: mots de passe compromis
+  4. Scoring de risque heuristique
+  5. Stockage dans ClickHouse
+
+
+3.3 CLICKHOUSE (Latest)
+──────────────────────
+Rôle: Data warehouse pour les événements
+
+Table: iam.login_events
+  Colonnes clés:
+    - event_time, realm, client_id, user_id, username
+    - event_type (LOGIN, LOGIN_ERROR, REGISTER...)
+    - ip, is_public_ip
+    - ua_browser, ua_os, ua_device
+    - device_fp (fingerprint)
+    - abuse_score, abuse_isp, abuse_country_code
+    - is_tor, greynoise_*, vt_malicious
+    - geo_country, geo_city, geo_latitude, geo_longitude
+    - fails_5m, fails_1h, fails_24h
+    - risk_score, step_up_required
+  
+Avantages:
+  - Stockage compressé (good pour big data)
+  - Requêtes GROUP BY très rapides
+  - FORMAT JSONEachRow simple pour insertion
+
+
+3.4 NGINX (Latest)
+──────────────────
+Rôle: Reverse proxy
+
+Headers Proxy (pour X-Forwarded-For):
+  proxy_set_header X-Forwarded-For $http_x_forwarded_for;
+  proxy_set_header X-Forwarded-Proto $scheme;
+  proxy_set_header X-Real-IP $remote_addr;
+
+Cela permet au Keycloak (KC_PROXY=edge) de lire l'IP réelle du client.
+
+
+3.5 POSTGRESQL (16)
+───────────────────
+Rôle: Base de données Keycloak
+
+Schemas:
+  - users : utilisateurs du realm
+  - roles : rôles et permissions
+  - events : logs des événements Keycloak
+  - sessions : sessions actives
+
+
+3.6 JAVA SPI (Service Provider Interface) - RiskEventListenerProvider
+────────────────────────────────────────────────────────────────────
+Localisation: keycloak-spi/kc-event-listener/src/main/java/tn/pfe/kc/
+
+Classes:
+  1. RiskEventListenerProvider : implémente EventListenerProvider
+     - onEvent(Event) : décorateur d'événement
+     - Récupère X-Forwarded-For des headers HTTP
+     - Détecte IP privée vs publique
+     - Envoie payload enrichi au collector
+  
+  2. RiskEventListenerProviderFactory : crée les instances
+
+Flux dans le SPI:
+  1. Keycloak génère un événement (LOGIN, etc.)
+  2. SPI onEvent() est appelé
+  3. Extraction IP:
+     - D'abord event.getIpAddress()
+     - Si privée et X-Forwarded-For existe → utiliser XFF
+  4. Extraction User-Agent
+  5. Construction payload JSON
+  6. HTTP POST au collector
+
+
+================================================================================
+4. FLUX D'AUTHENTIFICATION EN DÉTAIL
+================================================================================
+
+4.1 AUTHENTIFICATION UTILISATEUR (Flux OIDC)
+─────────────────────────────────────────────
+
+Étape 1: Utilisateur accède à app (ex: http://localhost:3000/admin)
+         ↓
+         Pas de session trouvée
+         ↓
+Étape 2: App redirige vers Keycloak
+         GET http://localhost:8081/realms/PFE-SSO/protocol/openid-connect/auth
+         params: client_id=admin-console-client-1&redirect_uri=...&...
+         ↓
+Étape 3: Utilisateur soumet login/password
+         POST http://localhost:8081/realms/PFE-SSO/login
+         ↓
+         [SPI RiskEventListenerProvider.onEvent() DÉCLENCHÉ]
+         • Type: LOGIN (si succès) ou LOGIN_ERROR (si erreur)
+         • IP: extracted from X-Forwarded-For
+         • Browser/OS: from User-Agent
+         • POST http://event-collector:8088/events
+         ↓
+Étape 4: Event-Collector reçoit l'événement
+         1. Récupère IP réelle
+         2. Parse User-Agent
+         3. Enrichit via AbuseIPDB, GeoLite2, etc.
+         4. Calcule risk_score
+         5. Si risk_score >= 60 → step_up_required = 1
+         6. INSERT dans ClickHouse
+         ↓
+Étape 5: Keycloak génère Authorization Code
+         302 Redirect → app avec code=...
+         ↓
+Étape 6: App échange code pour Access Token
+         POST http://localhost:8081/realms/PFE-SSO/protocol/openid-connect/token
+         params: client_id, client_secret, code, grant_type=authorization_code
+         ↓
+Étape 7: App reçoit Access Token (JWT)
+         {
+           "sub": "user-id",
+           "preferred_username": "hassan",
+           "realm_access": {
+             "roles": ["employee", "hr-manager"]
+           },
+           "exp": 1234567890
+         }
+         ↓
+Étape 8: App utilise Access Token pour appeler backend sécurisé
+         Authorization: Bearer eyJhbGc...
+         ↓
+         [Selon risk_score] Peut être challengé pour MFA
+
+
+4.2 MFA ADAPTATIF
+──────────────────
+
+Le score de risque est calculé comme:
+
+risk_score = 0
+
++ 35   si IP = nœud Tor
++ 40   si abuse_score >= 75
++ 25   si abuse_score >= 40
++ 10   si abuse_score > 0
++ 15   si GreyNoise.noise = true
++ 20   si VirusTotal.malicious > 0
++ 10   si nouveau device (device_fp jamais vu)
++ 20   si >= 3 échecs de login en 5 min
++ 15   si >= 5 échecs de login en 1h
++ 10   si app sensibilité >= 4 (ex: finance-client-3)
++ 5    si connexion entre 22h et 6h (night login)
+
+Total clamped à 100.
+
+RÈGLE DE MFA :
+  si risk_score >= 60
+    → step_up_required = 1
+    → Keycloak force un second facteur (TOTP, SMS, etc.)
+    → Accès accordé seulement après 2FA réussi
+
+
+4.3 ÉVÉNEMENT LOGIN ENREGISTRÉ DANS CLICKHOUSE
+──────────────────────────────────────────────
+
+ROW INSÉRÉ:
+{
+  "event_time": "2026-03-11 14:30:45",
+  "realm": "PFE-SSO",
+  "client_id": "hr-client-4",
+  "user_id": "user-123",
+  "username": "hassan.tounsi",
+  "event_type": "LOGIN",
+  "ip": "203.113.44.55",                    # IP réelle (via X-Forwarded-For)
+  "is_public_ip": 1,
+  "error": "",
+  
+  "ua_raw": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0",
+  "ua_browser": "Chrome 120.0",
+  "ua_os": "Windows 10",
+  "ua_device": "pc",
+  "device_fp": "6f8885d65bdc2a5ca55fcfdc95384d0bc90195deb4ee...",
+  "is_new_device": 1,
+  
+  "hour": 14,
+  "day_of_week": 2,
+  "is_weekend": 0,
+  "is_night_login": 0,
+  "is_business_hours": 1,
+  
+  "fails_5m": 0,
+  "fails_1h": 0,
+  "fails_24h": 1,
+  "login_1h": 3,
+  
+  "abuse_score": 5,
+  "abuse_isp": "TOT public company limited",
+  "abuse_country_code": "TH",
+  
+  "is_tor": 0,
+  "greynoise_noise": 0,
+  
+  "geo_country": "Thailand",
+  "geo_city": "Bangkok",
+  "geo_latitude": 13.7442,
+  "geo_longitude": 100.4608,
+  "geo_timezone": "Asia/Bangkok",
+  
+  "risk_score": 15,
+  "risk_reasons": ["NEW_DEVICE", "NIGHT_LOGIN"],
+  "step_up_required": 0
+}
+
+
+================================================================================
+5. SYSTÈME DE SCORING IA ET D'ENRICHISSEMENT
+================================================================================
+
+5.1 ENRICHISSEMENT IP (enrichment.py)
+─────────────────────────────────────
+
+Ordre de priorité pour extraire l'IP réelle:
+  1. Header X-Forwarded-For (depuis Nginx)
+  2. Champ http_x_forwarded_for du payload Keycloak
+  3. Champ ipAddress du payload Keycloak
+  4. IP source brute FastAPI (request.client.host)
+
+Fonction: extract_real_ip(data, request) → string
+
+Validation IP:
+  - Doit être IP valide
+  - is_public_ip() = vérifier qu'elle est globale (pas privée RFC1918)
+
+
+5.2 SOURCES D'ENRICHISSEMENT
+──────────────────────────
+
+1. ABUSEIPDB
+   URL: https://api.abuseipdb.com/api/v2/check
+   Params: ipAddress, maxAgeInDays=90
+   Retourne:
+     - abuse_score (0-100)
+     - total_reports
+     - usage_type
+     - isp
+     - country_code
+     - domain
+   Cache: 1 heure
+   Clé: ABUSEIPDB_API_KEY (env)
+
+2. GEOLITE2
+   Type: Base de données locale (GeoIP2)
+   Fichier: /data/GeoLite2-City.mmdb
+   Retourne:
+     - country
+     - city
+     - postal_code
+     - latitude/longitude
+     - timezone
+     - asn
+   Pas de cache (local)
+
+3. GREYNOISE COMMUNITY
+   URL: https://api.greynoise.io/v3/community/{ip}
+   Retourne:
+     - noise (boolean) = bruit Internet scanning
+     - riot (boolean) = IP légitime (CDN, ISP)
+     - classification
+     - name
+   Cache: 1 heure
+   Clé: GREYNOISE_API_KEY (optionnel)
+
+4. TOR PROJECT BULK EXIT LIST
+   URL: https://check.torproject.org/torbulkexitlist
+   Cache: 6 heures
+   Retourne: Set d'IPs des nœuds de sortie Tor
+
+5. VIRUSTOTAL
+   URL: https://www.virustotal.com/api/v3/ip_addresses/{ip}
+   Retourne:
+     - malicious (count)
+     - suspicious
+     - harmless
+     - undetected
+   Cache: 1 heure
+   Clé: VIRUSTOTAL_API_KEY (optionnel)
+
+6. HIBP - PWNED PASSWORDS
+   URL: https://api.pwnedpasswords.com/range/{sha1_prefix}
+   Protocole: k-anonymity (on envoie que les 5 premiers chars du SHA1)
+   Retourne: count de compromissions
+   Pas de cache (rapide)
+
+
+5.3 SCORING DE RISQUE HEURISTIQUE
+──────────────────────────────────
+
+Fonction: risk_analysis(features_dict) → {risk_score, risk_reasons}
+
+RÈGLES DE SCORING:
+
+Rule 1: IP Privée
+  if not is_public_ip(ip):
+    risk_reasons.append("NON_PUBLIC_IP")
+    (pas de points, mais flagué)
+
+Rule 2: Tor Exit Node
+  if is_tor_exit_node(ip):
+    risk_score += 35
+    risk_reasons.append("TOR_EXIT_NODE")
+
+Rule 3: AbuseIPDB Score
+  if abuse_score >= 75:
+    risk_score += 40
+    risk_reasons.append("VERY_HIGH_ABUSE_SCORE")
+  elif abuse_score >= 40:
+    risk_score += 25
+    risk_reasons.append("HIGH_ABUSE_SCORE")
+  elif abuse_score > 0:
+    risk_score += 10
+    risk_reasons.append("NON_ZERO_ABUSE_SCORE")
+
+Rule 4: GreyNoise Noise
+  if greynoise_noise:
+    risk_score += 15
+    risk_reasons.append("GREYNOISE_NOISE")
+
+Rule 5: VirusTotal Malicious
+  if vt_malicious > 0:
+    risk_score += 20
+    risk_reasons.append("VT_MALICIOUS")
+
+Rule 6: Nouveau Device
+  if is_new_device(user_id, device_fp):
+    risk_score += 10
+    risk_reasons.append("NEW_DEVICE")
+
+Rule 7: Brute Force (5 min)
+  if failed_logins_5m >= 3:
+    risk_score += 20
+    risk_reasons.append("MULTIPLE_FAILS_5M")
+
+Rule 8: Brute Force (1h)
+  elif failed_logins_1h >= 5:
+    risk_score += 15
+    risk_reasons.append("MULTIPLE_FAILS_1H")
+
+Rule 9: Sensibilité App
+  if app_sensitivity(client_id) >= 4:  # finance-client-3 = 4
+    risk_score += 10
+    risk_reasons.append("SENSITIVE_APP")
+
+Rule 10: Night Login
+  if hour >= 22 or hour <= 6:
+    risk_score += 5
+    risk_reasons.append("NIGHT_LOGIN")
+
+TOTAL:
+  risk_score = clamped(0, 100)
+  step_up_required = 1 if risk_score >= 60 else 0
+
+
+5.4 MÉTRIQUES HISTORIQUES
+──────────────────────────
+
+Calculées par requête ClickHouse:
+
+count_fails(user_id, window_minutes):
+  SELECT COUNT(*) FROM login_events
+  WHERE user_id = ? AND event_type = 'LOGIN_ERROR'
+    AND event_time >= NOW() - interval ? minutes
+
+count_fails_hours(user_id, hours):
+  SELECT COUNT(*) FROM login_events
+  WHERE user_id = ? AND event_type = 'LOGIN_ERROR'
+    AND event_time >= NOW() - interval ? hours
+
+login_count_hours(user_id, hours):
+  SELECT COUNT(*) FROM login_events
+  WHERE user_id = ? AND event_type = 'LOGIN'
+    AND event_time >= NOW() - interval ? hours
+
+is_new_device(user_id, device_fp):
+  SELECT COUNT(*) FROM login_events
+  WHERE user_id = ? AND device_fp = ?
+  → 0 rows = NEW device
+
+
+5.5 CACHING
+───────────
+
+Caches mémoire pour éviter les requêtes répétées:
+
+_abuse_cache[ip] → {data, expires}
+_geolite_cache[ip] → {data, expires}
+_greynoise_cache[ip] → {data, expires}
+_vt_cache[ip] → {data, expires}
+_tor_cache → {ips: set(), expires}
+
+TTL par défaut: 3600 secondes (1 heure)
+TOR TTL: 21600 secondes (6 heures)
+
+Stratégie: On.check cache, si expiré on refresh
+
+
+================================================================================
+6. CONFIGURATION DOCKER ET DÉPLOIEMENT
+================================================================================
+
+6.1 DOCKER-COMPOSE.YML
+──────────────────────
+
+Services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0.0
+    env:
+      KC_PROXY: edge                    # Accepte X-Forwarded-For
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_HOSTNAME: http://localhost:8081
+      KC_HOSTNAME_STRICT: false
+      PFE_COLLECTOR_URL: http://event-collector:8088/events
+    volumes:
+      - ./keycloak-spi/.../kc-event-listener.jar:/opt/keycloak/providers/
+    ports: Pas exposé (accès via Nginx)
+
+  event-collector:
+    build: ./services/event-collector
+    env:
+      CLICKHOUSE_URL: http://clickhouse:8123
+      CLICKHOUSE_DB: iam
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: admin123
+      ABUSEIPDB_API_KEY: (from .env)
+      ABUSEIPDB_ENABLED: true
+    volumes:
+      - ./data/GeoLite2-City.mmdb:/app/data/GeoLite2-City.mmdb:ro
+    ports:
+      - "8088:8088"
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    env:
+      CLICKHOUSE_DB: iam
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: admin123
+    ports:
+      - "8123:8123"
+    volumes:
+      - ch_data:/var/lib/clickhouse
+
+  nginx:
+    image: nginx:latest
+    volumes:
+      - ./infra/nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "8081:80"
+
+  postgres:
+    image: postgres:16
+    env:
+      POSTGRES_DB: keycloak
+      POSTGRES_USER: keycloak
+      POSTGRES_PASSWORD: keycloak
+    ports:
+      - "5432:5432"
+
+
+6.2 DÉMARRAGE
+──────────────
+
+docker compose down          # Arrête tous les conteneurs
+docker compose up -d --build # Relance avec rebuild des images custom
+
+Vérification:
+  docker logs pfe_keycloak    # Logs d'initialisation
+  docker logs pfesso-event-collector-1
+  docker ps                   # Lister conteneurs
+
+
+6.3 VOLUMES & DONNÉES
+──────────────────────
+
+Volumes persistants:
+  pgdata: Données PostgreSQL Keycloak
+  ch_data: Données ClickHouse
+
+Fichiers montés (read-only):
+  ./data/GeoLite2-City.mmdb
+  ./infra/nginx/default.conf
+  ./keycloak-spi/.../kc-event-listener.jar
+
+
+================================================================================
+7. ENDPOINTS API
+================================================================================
+
+7.1 EVENT-COLLECTOR
+────────────────────
+
+POST /events
+  Description: Reçoit un événement Keycloak, l'enrichit, le stocke, retourne le résultat
+  
+  Body (JSON):
+  {
+    "type": "LOGIN",
+    "realm": "PFE-SSO",
+    "clientId": "hr-client-4",
+    "userId": "user-123",
+    "ipAddress": "172.20.0.1",           # IP vue par Keycloak (peut être proxy IP)
+    "http_x_forwarded_for": "203.113.44.55",  # En-tête du reverse proxy
+    "http_user_agent": "Mozilla/5.0...",
+    "error": "",
+    "details": {
+      "username": "hassan.tounsi",
+      "client_ip": "..."                 # Optionnel
+    }
+  }
+  
+  Response:
+  {
+    "status": "ok",
+    "stored": true,
+    "features": {
+      "ip": "203.113.44.55",
+      "is_public_ip": 1,
+      "abuse_score": 5,
+      "geo_country": "Thailand",
+      "risk_score": 15,
+      "step_up_required": 0,
+      ... (tous les champs du row inséré)
+    }
+  }
+
+
+GET /
+  Description: Health check
+  Response:
+  {
+    "status": "ok",
+    "service": "event-collector"
+  }
+
+
+POST /check-password
+  Description: Teste si un mot de passe est compromis (HIBP)
+  
+  Body:
+  {
+    "password": "monMotDePasse123"
+  }
+  
+  Response:
+  {
+    "pwned": false,
+    "exposure_count": 0,
+    "message": "OK"
+  }
+
+
+7.2 KEYCLOAK RÉALMM OIDC ENDPOINTS
+──────────────────────────────────
+
+GET /realms/PFE-SSO/.well-known/openid-configuration
+  Discovery endpoint
+  Retourne: token_endpoint, authorization_endpoint, etc.
+
+GET /realms/PFE-SSO/protocol/openid-connect/auth
+  Authorization endpoint (login redirect)
+  Params: client_id, redirect_uri, response_type, scope, state
+
+POST /realms/PFE-SSO/protocol/openid-connect/token
+  Token endpoint (échange code → token)
+  Body: client_id, client_secret, code, grant_type
+
+POST /realms/PFE-SSO/protocol/openid-connect/userinfo
+  Userinfo endpoint (récupère claims utilisateur)
+  Header: Authorization: Bearer {accessToken}
+
+POST /realms/PFE-SSO/protocol/openid-connect/logout
+  Logout endpoint
+  Invalide la session
+
+
+7.3 CLICKHOUSE API
+──────────────────
+
+POST / HTTP/1.1
+Header: Authorization (si auth activée)
+Body: SELECT ... FROM iam.login_events
+
+Exemples requêtes:
+  SELECT count() FROM iam.login_events WHERE event_type = 'LOGIN' AND event_time >= now() - INTERVAL 1 DAY
+  SELECT user_id, risk_score FROM iam.login_events ORDER BY risk_score DESC LIMIT 10
+
+
+================================================================================
+8. SCHÉMAS DE DONNÉES
+================================================================================
+
+8.1 TABLE ClickHouse: iam.login_events
+──────────────────────────────────────
+
+CREATE TABLE iam.login_events (
+  -- Identifiants & contexte
+  event_time DateTime,
+  realm String,
+  client_id String,
+  user_id String,
+  username String,
+  event_type String,              -- LOGIN, LOGIN_ERROR, LOGOUT, REGISTER, etc.
+  error String,
+  session_id String,
+  
+  -- IP & Réseau
+  ip String,
+  is_public_ip UInt8,             -- 0=private, 1=public
+  
+  -- User-Agent & Device
+  ua_raw String,
+  ua_browser String,              -- ex: "Chrome 120.0"
+  ua_os String,                   -- ex: "Windows 10"
+  ua_device String,               -- pc, mobile, tablet, other
+  device_fp String,               -- SHA256(ua + ip)
+  is_new_device UInt8,
+  
+  -- Temps
+  hour UInt8,
+  day_of_week UInt8,              -- 0=Monday, 6=Sunday
+  is_weekend UInt8,               -- 0=semaine, 1=WE
+  is_night_login UInt8,           -- 1 si 22h-6h
+  is_business_hours UInt8,        -- 1 si 8h-18h
+  
+  -- Historiques
+  fails_5m UInt32,                -- Échecs login en 5 min
+  fails_1h UInt32,                -- Échecs login en 1h
+  fails_24h UInt32,               -- Échecs login en 24h
+  login_1h UInt32,                -- Logins réussis en 1h
+  event_success UInt8,            -- 1 si LOGIN sans erreur
+  app_sensitivity UInt8,          -- 0-5, sensibilité de l'app
+  
+  -- AbuseIPDB
+  abuse_score UInt8,              -- 0-100
+  ip_reports UInt32,
+  abuse_usage_type String,
+  abuse_isp String,
+  abuse_domain String,
+  abuse_country_code String,
+  abuse_last_reported_at String,
+  
+  -- Tor
+  is_tor UInt8,
+  
+  -- GreyNoise
+  greynoise_noise UInt8,
+  greynoise_riot UInt8,
+  greynoise_classification String,
+  
+  -- VirusTotal
+  vt_malicious UInt8,
+  vt_suspicious UInt8,
+  vt_reputation Int32,
+  
+  -- GeoLite2
+  geo_country String,
+  geo_country_code String,
+  geo_city String,
+  geo_postal_code String,
+  geo_latitude Float32,
+  geo_longitude Float32,
+  geo_timezone String,
+  
+  -- Scoring
+  risk_score UInt8,               -- 0-100
+  risk_reasons String,            -- JSON array de raisons
+  step_up_required UInt8,         -- 1 si MFA required
+  
+  -- Enrichissement JSON
+  ip_enrichment_json String       -- Dump complet de l'enrichissement
+) ENGINE = MergeTree()
+ORDER BY (event_time, user_id, realm);
+
+
+8.2 KEYCLOAK REALM SCHEMA (JSON)
+─────────────────────────────────
+
+realm-full.json contient:
+
+{
+  "realm": "PFE-SSO",
+  "enabled": true,
+  "accessTokenLifespan": 300,     -- 5 minutes
+  "ssoSessionIdleTimeout": 1800,  -- 30 minutes
+  "ssoSessionMaxLifespan": 36000, -- 10 heures
+  
+  "roles": {
+    "realm": [
+      {"name": "employee"},
+      {"name": "hr-manager"},
+      {"name": "finance-manager"},
+      {"name": "crm-admin"},
+      {"name": "system-admin"}
+    ]
+  },
+  
+  "clients": [
+    {
+      "clientId": "admin-console-client-1",
+      "clientSecret": "...",
+      "redirectUris": ["http://localhost:3000/admin/callback"],
+      "roles": ["system-admin"]
+    },
+    {
+      "clientId": "hr-client-4",
+      "clientSecret": "...",
+      "redirectUris": ["http://localhost:3001/hr/callback"],
+      "roles": ["employee", "hr-manager"]
+    },
+    {
+      "clientId": "finance-client-3",
+      "clientSecret": "...",
+      "redirectUris": ["http://localhost:3002/finance/callback"],
+      "roles": ["finance-manager"]
+    },
+    ... etc ...
+  ],
+  
+  "users": [
+    {
+      "username": "admin",
+      "email": "admin@example.com",
+      "roles": ["system-admin"],
+      "credentials": [
+        {
+          "type": "password",
+          "value": "{hashed_password}"
+        }
+      ]
+    },
+    ...
+  ]
+}
+
+
+8.3 APPLICATIONS CLIENT (Node.js)
+──────────────────────────────────
+
+Structure (ex: admin/server.js):
+
+// 1. OIDC + Keycloak
+const { buildClient, extractRealmRoles } = require("../shared/oidc.js");
+const { Issuer } = require("openid-client");
+
+// 2. Configuration
+const KEYCLOAK_BASE = "http://localhost:8081";
+const REALM = "PFE-SSO";
+const CLIENT_ID = "admin-console-client-1";
+const CLIENT_SECRET = "...";
+const REDIRECT_URI = "http://localhost:3000/admin/callback";
+
+// 3. Routes
+app.get("/login", async (req, res) => {
+  // Génère l'URL de login Keycloak
+  const client = await buildClient(...);
+  const authorizationUrl = client.authorizationUrl({...});
+  res.redirect(authorizationUrl);
+});
+
+app.get("/callback", async (req, res) => {
+  // Échange authorization_code pour tokens
+  const tokens = await client.callback(REDIRECT_URI, req.query);
+  const { access_token, refresh_token } = tokens;
+  req.session.user = {
+    token: access_token,
+    roles: extractRealmRoles(access_token),
+    info: tokens.claims()
+  };
+  res.redirect("/admin/dashboard");
+});
+
+app.get("/dashboard", authenticated, (req, res) => {
+  // Page admin, protégée par middleware d'authentification
+  res.render("dashboard", { user: req.session.user });
+});
+
+
+================================================================================
+9. POINTS CRITIQUES ET SÉCURITÉ
+================================================================================
+
+9.1 SÉCURITÉ
+────────────
+
+1. HTTPS / TLS
+   - En production: HTTPS obligatoire (nginx avec certificat SSL)
+   - Actuellement: HTTP local (dev seulement)
+
+2. SECRETS
+   - client_secret stocké dans docker-compose (à utiliser .env en prod)
+   - ABUSEIPDB_API_KEY stocké en .env
+   - CLICKHOUSE_PASSWORD : "admin123" → À changer en production
+
+3. PROTECTION BRUTE FORCE
+   - Keycloak a bruteForceProtected: false (À activer en prod)
+   - Event-collector compte les fails_5m/fails_1h
+   - Risk scoring peut bloquer après N tentatives
+
+4. VALIDATION INPUT
+   - Event-collector valide event.type, realm, user_id
+   - Échappement SQL pour ClickHouse queries
+   - Validation IP (must be valid IPv4)
+
+5. CORS / CSRF
+   - Event-collector accepte POST /events de n'importe où (À restreindre en prod)
+   - CSRF tokens à considérer pour les clients web
+
+6. API EXTERNE
+   - AbuseIPDB, GreyNoise, VirusTotal : appels sur HTTPS
+   - Timeouts: 5 secondes par défaut
+   - Si une API externe lente/down → continue quand même (non-blocking)
+
+
+9.2 POINTS DE DÉFAILLANCE
+──────────────────────────
+
+1. Keycloak down
+   → Impossible de s'authentifier
+   → Event-collector continue (buffer pas d'événements)
+
+2. ClickHouse down
+   → Impossibilité d'insérer les événements
+   → Event-collector retourne erreur
+   → Perte de données pendant l'outage
+
+3. API Externale (AbuseIPDB, etc.) lente
+   → Enrichissement incomplet
+   → Peut ralentir /events endpoint
+   → Mitigation: timeout + cache
+
+4. Nginx pas configuré pour X-Forwarded-For
+   → IP du client = IP du gateway Docker
+   → Risk scoring dégradé
+
+5. PostgreSQL down
+   → Keycloak impossible à démarrer
+   → Perte de sessions utilisateur
+
+
+9.3 OPTIMISATIONS FUTURES
+──────────────────────────
+
+1. Machine Learning (LightGBM)
+   - Remplacer heuristiques par modèle ML pour risk_score
+   - Apprentissage sur événements historiques
+
+2. Détection d'anomalies
+   - Pattern recognition: ex. "Cet utilisateur se connecte toujours de France"
+   - Alerte si connexion depuis pays inhabituel
+
+3. Pipeline temps réel Kafka
+   - Remplacer HTTP POST par message queue
+   - Meilleure scalabilité
+
+4. Dashboard temps réel
+   - Kibana / Grafana sur ClickHouse
+   - Alertes en temps réel
+
+5. Step-Up Authentication flexible
+   - Non juste MFA, mais contextuel : 
+     - Si risk >= 60: MFA TOTP
+     - Si risk >= 75: MFA + Questions de sécurité
+     - Si risk >= 90: Vérification supplémentaire (email, appel)
+
+6. Geofencing
+   - Imposer connexion uniquement de certains pays/villes
+   - Utile pour data sensitives
+
+
+================================================================================
+10. EXAMPLES DE FLUX RÉELS
+================================================================================
+
+SCENARIO 1: Login Normal
+─────────────────────
+
+1. Hassan se connecte à l'app HR depuis son bureau (Bangkok, office IP = 203.113.44.55)
+2. Login réussit
+3. Event: LOGIN
+   - IP: 203.113.44.55 (recognized, ISP=TOT Thailand)
+   - Device: MacBook Pro (Safari), new_device=0 (vu avant)
+   - Hora: 10:30 = business hours
+   - Abuse score: 0 (pas d'antécédent)
+   - Tor: non
+4. Risk score calculé:
+   - Base = 0
+   - Device connu: 0
+   - Pas d'erreurs récentes: 0
+   - Business hours: 0
+   - Total = 0 → step_up_required = 0
+5. MFA non requise → Accès immédiat
+
+
+SCENARIO 2: Login Suspicious (Nouveau Device en Night)
+──────────────────
+
+1. Hassan se connecte à l'app Finance depuis VPN (IP = 45.33.12.7, USA)
+2. Login réussit
+3. Event: LOGIN
+   - IP: 45.33.12.7 (VPN provider)
+   - Device: Windows 11 + Chrome, new_device=1 (jamais vu)
+   - Hora: 02:00 = night
+   - Abuse score: 0
+   - Tor: non
+4. Risk score calculé:
+   - Nouveau device: +10
+   - Night login: +5
+   - Total = 15 → step_up_required = 0 (< 60)
+   - Mais alerté en backend pour suivi
+5. Pas de MFA, accès accordé
+
+
+SCENARIO 3: Login Blocked (Tor / Multiple Fails)
+──────────────────
+
+1. Tentative de login avec IP = 185.220.100.1 (Tor exit node)
+2. Username = "admin"
+3. Password = faux (3ème echec en 5 min)
+4. Event: LOGIN_ERROR
+   - IP: 185.220.100.1
+   - Device: Linux + Firefox, device_fp = unknown
+   - Abuse score = 75 (rapporté 500+ fois)
+   - Tor: YES
+   - Echecs 5m: 3
+5. Risk score calculé:
+   - Tor: +35
+   - Abuse 75+: +40
+   - Nouveau device: +10
+   - Echecs 5m >= 3: +20
+   - Total = 105 → clamped = 100 → step_up_required = 1
+6. Keycloak bloque la tentative
+7. Admin alerte + log : "Probable attaque brute force depuis Tor"
+
+
+SCENARIO 4: Événement Login_Error (Credentials Réjectés)
+──────────────────
+
+1. Tentative login rate-limiting
+   - User = "hassan@company.com"
+   - Password = mauvais (1ère fois)
+2. Event: LOGIN_ERROR
+   - IP: 203.113.44.55 (normale)
+   - Device: Chrome, connu
+   - Error: "Invalid credentials"
+3. Risk score:
+   - Pas d'historique d'erreurs: 0
+   - Total = 0 (attempt isolé)
+4. Keycloak permet retry normalement
+   Note: Après 30 erreurs en 15 min → Keycloak lockout auto (bruteForceProtected=true)
+
+
+================================================================================
+CONCLUSION
+================================================================================
+
+Ce projet implémente un système d'authentification moderne et adaptatif combinant:
+
+✓ SSO centralisé (Keycloak+OIDC)
+✓ Enrichissement IP temps réel (AbuseIPDB, GeoLite2, Tor, etc.)
+✓ Scoring de risque heuristique
+✓ MFA adaptatif basé sur le risque
+✓ Audit complet en temps réel (ClickHouse)
+✓ Architecture microservices scalable sur Docker
+
+Le système détecte et bloque automatiquement:
+- Tentatives depuis IP connues malveillantes
+- Nouveau device/géolocalisation suspecte
+- Brute force attacks
+- Connexions depuis nœuds Tor
+- Nuits connexions suspectes
+
+Et peut être étendu avec:
+- Machine Learning pour anomaly detection
+- Geofencing
+- Step-up authentication flexible
+- Integration SIEM
+- Dashboard temps réel
+
+
+================================================================================
+[FIN DE LA DOCUMENTATION]
+================================================================================

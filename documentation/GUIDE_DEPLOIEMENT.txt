@@ -1,0 +1,1075 @@
+================================================================================
+                    GUIDE DE DÉPLOIEMENT - SSO + MFA + IA
+         Projet d'Authentification Adaptative avec Keycloak et IA
+================================================================================
+
+TABLE DES MATIÈRES
+================================================================================
+1. Prérequis
+2. Structure du projet
+3. Déploiement local (Development)
+4. Déploiement Staging
+5. Déploiement Production
+6. Configuration avancée
+7. Monitoring et logs
+8. Troubleshooting
+
+
+================================================================================
+1. PRÉREQUIS
+================================================================================
+
+1.1 LOGICIELS REQUIS
+────────────────────
+
+Pour TOUS les environnements:
+  • Docker 20.10+
+  • Docker Compose 2.0+
+  • Git
+
+Pour développement local supplémentaire:
+  • Java 17+ (pour compiler le SPI Keycloak)
+  • Maven 3.8+
+  • Node.js 18+ (pour les apps clientes)
+  • npm ou yarn
+
+Vérification:
+  docker --version
+  docker compose --version
+  java -version
+  mvn --version
+  node --version
+
+
+1.2 RESSOURCES SYSTÈME
+──────────────────────
+
+DEVELOPMENT (Local):
+  RAM: 4GB minimum (recommandé 8GB)
+  CPU: 2 cores
+  Disk: 10GB libre
+
+STAGING:
+  RAM: 8GB
+  CPU: 4 cores
+  Disk: 20GB
+
+PRODUCTION:
+  RAM: 16GB+ (par réplica)
+  CPU: 8 cores
+  Disk: 50GB+ (selon logs/données)
+
+
+1.3 CLÉS API & SECRETS
+──────────────────────
+
+Avant déploiement, obtenir les clés:
+
+  ✓ ABUSEIPDB_API_KEY
+    - Signup: https://www.abuseipdb.com/register
+    - Free tier: 1000 requêtes/jour
+    - Format: API key (ex: e5faf06ff0147d8c...)
+
+  ✓ GREYNOISE_API_KEY (optionnel)
+    - Signup: https://www.greynoise.io/
+    - Community libre
+
+  ✓ VIRUSTOTAL_API_KEY (optionnel)
+    - Signup: https://www.virustotal.com/
+    - Free tier: 4 requêtes/min
+
+  ✓ GeoLite2 Database
+    - Télécharger: https://www.maxmind.com/en/geoip2-databases
+    - Free tier: GeoLite2-City.mmdb
+    - Placement: /data/GeoLite2-City.mmdb
+
+
+================================================================================
+2. STRUCTURE DU PROJET
+================================================================================
+
+proyecto-root/
+├── docker-compose.yml             # Configuration Docker
+├── .env                           # Variables d'environnement
+├── .env.example                   # Template .env
+├── .env.staging                   # Config staging
+├── .env.production                # Config production
+│
+├── README.md                      # Readme général
+├── DOCUMENTATION_COMPLETE.txt     # Doc architecture
+├── GUIDE_DEPLOIEMENT.txt          # Ce fichier
+│
+├── data/
+│   └── GeoLite2-City.mmdb        # Base géolocalisation
+│
+├── infra/
+│   └── nginx/
+│       └── default.conf           # Config reverse proxy
+│
+├── keycloak/
+│   └── realm-full.json            # Configuration realm Keycloak
+│
+├── keycloak-spi/
+│   └── kc-event-listener/
+│       ├── pom.xml                # Build Maven
+│       ├── src/main/java/...      # Code Java listener
+│       └── target/
+│           └── kc-event-listener-1.0.0.jar  # JAR compilé
+│
+├── services/
+│   └── event-collector/
+│       ├── Dockerfile             # Image Docker
+│       ├── main.py                # FastAPI app
+│       ├── enrichment.py          # Logique enrichissement
+│       ├── requirements.txt       # Dépendances Python
+│       └── .env                   # Variables locales
+│
+└── SP/
+    ├── package.json
+    ├── shared/
+    │   └── oidc.js                # Library OIDC commune
+    ├── admin/
+    ├── hr/
+    ├── finance/
+    ├── crm/
+    └── portal/
+
+
+================================================================================
+3. DÉPLOIEMENT LOCAL (Development)
+================================================================================
+
+3.1 SETUP INITIAL
+──────────────────
+
+Étape 1: Cloner le projet
+  git clone <repo-url>
+  cd PFE-SSO_MFA+IA
+
+
+Étape 2: Créer fichier .env
+  cp .env.example .env
+  
+  Éditer .env et remplir:
+  
+  ============ .env ============
+  # Keycloak Admin
+  KEYCLOAK_ADMIN_USERNAME=admin
+  KEYCLOAK_ADMIN_PASSWORD=admin
+  
+  # PostgreSQL
+  POSTGRES_DB=keycloak
+  POSTGRES_USER=keycloak
+  POSTGRES_PASSWORD=keycloak
+  
+  # ClickHouse
+  CLICKHOUSE_URL=http://clickhouse:8123
+  CLICKHOUSE_DB=iam
+  CLICKHOUSE_USER=default
+  CLICKHOUSE_PASSWORD=admin123
+  
+  # APIs Externes
+  ABUSEIPDB_API_KEY=<your-api-key>
+  ABUSEIPDB_ENABLED=true
+  
+  GREYNOISE_API_KEY=<optional>
+  GREYNOISE_ENABLED=false
+  
+  VIRUSTOTAL_API_KEY=<optional>
+  VIRUSTOTAL_ENABLED=false
+  
+  # Feature Flags
+  HIBP_ENABLED=true
+  TOR_BULK_ENABLED=true
+  GEOLITE2_ENABLED=true
+  
+  # Cache & Timeouts
+  ENRICHMENT_CACHE_TTL=3600
+  ENRICHMENT_HTTP_TIMEOUT=5
+  TOR_CACHE_TTL=21600
+  ================================
+
+
+Étape 3: Télécharger GeoLite2 Database
+  mkdir -p data
+  # Télécharger depuis https://www.maxmind.com
+  # Placer le fichier: data/GeoLite2-City.mmdb
+  
+  Vérifier:
+    ls -lh data/GeoLite2-City.mmdb
+
+
+Étape 4: Compiler le SPI Keycloak
+  cd keycloak-spi/kc-event-listener
+  mvn clean package
+  
+  Output attendu:
+    BUILD SUCCESS
+    Created: target/kc-event-listener-1.0.0.jar
+
+
+Étape 5: Lancer Docker Compose
+  cd ../..  # Retour à la root
+  docker compose down  # Arrêter les anciens conteneurs
+  docker compose up -d --build
+  
+  Vérifier le démarrage:
+    docker compose ps
+    
+  Output attendu:
+    NAME                        STATUS
+    pfe_postgres                Up (healthy)
+    pfe_clickhouse              Up (healthy)
+    pfe_keycloak                Up (starting)
+    pfesso-event-collector-1    Up (healthy)
+    pfe_nginx                   Up
+
+
+3.2 VÉRIFICATION DE L'INSTALLATION
+──────────────────────────────────
+
+Health Checks:
+
+1. Nginx/Keycloak est accessible
+   curl http://localhost:8081/realms/PFE-SSO/.well-known/openid-configuration
+   
+   Output: JSON avec endpoints OIDC
+   
+2. Event-Collector fonctionne
+   curl http://localhost:8088/
+   
+   Output: {"status": "ok", "service": "event-collector"}
+
+3. ClickHouse répond
+   curl http://localhost:8123/?query=SELECT%201
+   
+   Output: 1
+
+4. PostgreSQL est prêt
+   docker exec pfe_postgres psql -U keycloak -d keycloak -c "SELECT 1"
+   
+   Output: 1
+
+
+3.3 TESTER LE FLUX COMPLET
+───────────────────────────
+
+Test 1: Envoyer un événement au collecteur
+
+  curl -X POST http://localhost:8088/events \
+    -H "Content-Type: application/json" \
+    -d '{
+      "type": "LOGIN",
+      "realm": "PFE-SSO",
+      "clientId": "hr-client-4",
+      "userId": "test-user-1",
+      "ipAddress": "172.20.0.1",
+      "http_x_forwarded_for": "8.8.8.8",
+      "http_user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+      "error": "",
+      "details": {"username": "ghana"}
+    }'
+  
+  Output: JSON with risk_score, geo_country, abuse_score, etc.
+
+
+Test 2: Vérifier insertion ClickHouse
+
+  docker exec pfe_clickhouse clickhouse-client --query \
+    "SELECT COUNT(*) FROM iam.login_events"
+  
+  Output: 1 (ou plus si tests antérieurs)
+
+
+Test 3: Query ClickHouse avancée
+
+  docker exec pfe_clickhouse clickhouse-client --query \
+    "SELECT 
+      username,
+      event_type,
+      geo_country,
+      abuse_score,
+      risk_score,
+      step_up_required
+    FROM iam.login_events
+    LIMIT 10"
+
+
+3.4 LOGS ET DÉBOGAGE
+────────────────────
+
+Voir les logs en direct:
+
+  # Keycloak
+  docker logs -f pfe_keycloak
+  
+  # Event-Collector
+  docker logs -f pfesso-event-collector-1
+  
+  # ClickHouse
+  docker logs -f pfe_clickhouse
+  
+  # Nginx
+  docker logs -f pfe_nginx
+
+
+Accéder aux conteneurs:
+
+  # Shell Keycloak
+  docker exec -it pfe_keycloak bash
+  
+  # Python repl event-collector
+  docker exec -it pfesso-event-collector-1 python3
+  
+  # CLI ClickHouse
+  docker exec -it pfe_clickhouse clickhouse-client
+
+
+================================================================================
+4. DÉPLOIEMENT STAGING
+================================================================================
+
+4.1 CONFIGURATION STAGING
+──────────────────────────
+
+Créer fichier .env.staging:
+
+  ============ .env.staging ============
+  # Keycloak
+  KEYCLOAK_ADMIN_USERNAME=admin
+  KEYCLOAK_ADMIN_PASSWORD=<strong-password-staging>
+  KC_PROXY=edge
+  KC_HOSTNAME=https://sso-staging.company.com
+  
+  # Base de données
+  POSTGRES_USER=keycloak
+  POSTGRES_PASSWORD=<strong-db-password>
+  
+  CLICKHOUSE_PASSWORD=<strong-ch-password>
+  
+  # APIs Externes
+  ABUSEIPDB_API_KEY=<production-key>
+  ABUSEIPDB_ENABLED=true
+  GREYNOISE_ENABLED=true
+  VIRUSTOTAL_ENABLED=false
+  
+  # Cache (plus agressif en staging)
+  ENRICHMENT_CACHE_TTL=7200
+  TOR_CACHE_TTL=43200
+  
+  # Logging
+  LOG_LEVEL=INFO
+  
+  # Volumes persistants
+  POSTGRES_DATA_PATH=/mnt/data/postgres
+  CLICKHOUSE_DATA_PATH=/mnt/data/clickhouse
+  ========================================
+
+
+4.2 DOCKER COMPOSE POUR STAGING
+────────────────────────────────
+
+Créer docker-compose.staging.yml:
+
+  version: '3.8'
+  
+  services:
+    postgres:
+      image: postgres:16
+      environment:
+        POSTGRES_DB: keycloak
+        POSTGRES_USER: ${POSTGRES_USER}
+        POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      volumes:
+        - ${POSTGRES_DATA_PATH}/pgdata:/var/lib/postgresql/data
+      restart: always
+    
+    keycloak:
+      image: quay.io/keycloak/keycloak:26.0.0
+      command: start
+      environment:
+        KC_DB: postgres
+        KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+        KC_DB_USERNAME: ${POSTGRES_USER}
+        KC_DB_PASSWORD: ${POSTGRES_PASSWORD}
+        KC_PROXY: edge
+        KC_HOSTNAME: ${KC_HOSTNAME}
+        KC_HTTPS_CERTIFICATE_FILE: /etc/ssl/certs/tls.crt
+        KC_HTTPS_CERTIFICATE_KEY_FILE: /etc/ssl/private/tls.key
+        KC_HOSTNAME_STRICT: "true"
+        KC_HOSTNAME_STRICT_HTTPS: "true"
+      volumes:
+        - ./keycloak-spi/kc-event-listener/target/kc-event-listener-1.0.0.jar:/opt/keycloak/providers/
+        - /etc/ssl/certs/tls.crt:/etc/ssl/certs/tls.crt:ro
+        - /etc/ssl/private/tls.key:/etc/ssl/private/tls.key:ro
+      restart: always
+      depends_on:
+        - postgres
+    
+    event-collector:
+      build: ./services/event-collector
+      environment:
+        CLICKHOUSE_URL: http://clickhouse:8123
+        ABUSEIPDB_API_KEY: ${ABUSEIPDB_API_KEY}
+      restart: always
+      depends_on:
+        - clickhouse
+    
+    clickhouse:
+      image: clickhouse/clickhouse-server:latest
+      environment:
+        CLICKHOUSE_DB: iam
+        CLICKHOUSE_USER: ${CLICKHOUSE_USER}
+        CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD}
+      volumes:
+        - ${CLICKHOUSE_DATA_PATH}/ch_data:/var/lib/clickhouse
+      restart: always
+    
+    nginx:
+      image: nginx:latest
+      ports:
+        - "80:80"
+        - "443:443"
+      volumes:
+        - ./infra/nginx/default-staging.conf:/etc/nginx/conf.d/default.conf:ro
+        - /etc/ssl/certs/tls.crt:/etc/ssl/certs/tls.crt:ro
+        - /etc/ssl/private/tls.key:/etc/ssl/private/tls.key:ro
+      restart: always
+
+
+4.3 DÉPLOIEMENT SUR STAGING
+──────────────────────────
+
+Étape 1: SSH sur serveur staging
+  ssh user@staging-server.com
+
+
+Étape 2: Cloner/Mettre à jour le code
+  cd /srv/pfe-sso
+  git pull origin develop
+
+
+Étape 3: Compiler le SPI
+  ./scripts/build-spi.sh
+
+
+Étape 4: Charger les variables d'environnement
+  export $(cat .env.staging | xargs)
+
+
+Étape 5: Lancer avec docker-compose.staging.yml
+  docker compose -f docker-compose.staging.yml down
+  docker compose -f docker-compose.staging.yml up -d --build
+
+
+Étape 6: Vérifier les logs
+  docker compose -f docker-compose.staging.yml logs -f
+
+
+Étape 7: Importer le realm Keycloak (1ère fois seulement)
+  docker exec -i pfe_keycloak /opt/keycloak/bin/kcadm.sh \
+    create realms \
+    -s realm=PFE-SSO \
+    -s enabled=true \
+    -f /path/to/realm-full.json
+
+
+================================================================================
+5. DÉPLOIEMENT PRODUCTION
+================================================================================
+
+5.1 INFRASTRUCTURE PRODUCTION
+──────────────────────────────
+
+Architecture recommandée:
+
+  [CDN CloudFlare]
+              ↓
+  [Load Balancer (HAProxy/AWS ALB)]
+         ↙    ↓    ↘
+    [Nginx 1] [Nginx 2] [Nginx 3]
+         ↙    ↓    ↘
+    [Keycloak Cluster]
+       (3+ replicas)
+         ↙    ↓    ↘
+    [PostgreSQL Replication]
+       (Primary + 2 replicas)
+         
+    [Event-Collector Cluster]
+       (3+ replicas)
+              ↓
+    [ClickHouse Cluster]
+       (3+ shards, 2+ replicas)
+         
+    [Monitoring: Prometheus + Grafana]
+    [Logging: ELK Stack]
+
+
+5.2 CONFIGURATION PRODUCTION
+─────────────────────────────
+
+Créer .env.production:
+
+  ============ .env.production ============
+  # Basic Auth (Keycloak)
+  KEYCLOAK_ADMIN_USERNAME=<random>
+  KEYCLOAK_ADMIN_PASSWORD=<very-strong-password-32+chars>
+  
+  # Database
+  POSTGRES_USER=keycloak_prod
+  POSTGRES_PASSWORD=<very-strong-db-password>
+  POSTGRES_DB=keycloak_prod
+  
+  # ClickHouse
+  CLICKHOUSE_USER=default
+  CLICKHOUSE_PASSWORD=<very-strong-ch-password>
+  CLICKHOUSE_DB=iam
+  
+  # Keycloak Config
+  KC_PROXY=edge
+  KC_HOSTNAME=https://sso.company.com
+  KC_HOSTNAME_STRICT=true
+  KC_HOSTNAME_STRICT_HTTPS=true
+  KC_DB_SSL=true
+  
+  # APIs Externes
+  ABUSEIPDB_API_KEY=<production-api-key>
+  ABUSEIPDB_ENABLED=true
+  GREYNOISE_API_KEY=<production-api-key>
+  GREYNOISE_ENABLED=true
+  VIRUSTOTAL_API_KEY=<production-api-key>
+  VIRUSTOTAL_ENABLED=true
+  
+  # Caching agressif
+  ENRICHMENT_CACHE_TTL=7200
+  TOR_CACHE_TTL=43200
+  
+  # Logging
+  LOG_LEVEL=WARN
+  SENTRY_DSN=https://..../sentry
+  
+  # Data Paths
+  POSTGRES_DATA_PATH=/srv/data/postgres
+  CLICKHOUSE_DATA_PATH=/srv/data/clickhouse
+  
+  # Backup
+  BACKUP_ENABLED=true
+  BACKUP_S3_BUCKET=pfe-sso-backups
+  BACKUP_S3_REGION=eu-west-1
+  
+  # SSL Certificates
+  SSL_CERT_PATH=/etc/ssl/certificates/sso/cert.pem
+  SSL_KEY_PATH=/etc/ssl/certificates/sso/key.pem
+  =========================================
+
+
+5.3 ÉTAPES DE DÉPLOIEMENT PRODUCTION
+─────────────────────────────────────
+
+Prérequis:
+  - 3+ serveurs (ou cluster Kubernetes)
+  - Certificat SSL valide (Let's Encrypt ou CA)
+  - Load Balancer configuré
+  - Monitoring + alertes
+
+
+Étape 1: Configuration Load Balancer
+  
+  Exemple HAProxy:
+  
+    frontend sso_prod
+      bind 0.0.0.0:443 ssl crt /etc/ssl/certs/sso.pem
+      mode http
+      default_backend keycloak_cluster
+    
+    backend keycloak_cluster
+      balance roundrobin
+      server kc1 keycloak-1:8080 check
+      server kc2 keycloak-2:8080 check
+      server kc3 keycloak-3:8080 check
+
+
+Étape 2: Setup Database Replication
+  
+  PostgreSQL Streaming Replication:
+    Primary: postgres-primary
+    Replica 1: postgres-replica-1
+    Replica 2: postgres-replica-2
+  
+  Configuration WAL:
+    wal_level = replica
+    max_wal_senders = 3
+    wal_keep_size = 1GB
+
+
+Étape 3: Setup ClickHouse Cluster
+  
+  ClickHouse cluster config:
+    <remote_servers>
+      <iam>
+        <shard>
+          <replica>
+            <host>clickhouse-1</host>
+            <port>9000</port>
+          </replica>
+          <replica>
+            <host>clickhouse-2</host>
+            <port>9000</port>
+          </replica>
+        </shard>
+        <shard>
+          <replica>
+            <host>clickhouse-3</host>
+            <port>9000</port>
+          </replica>
+          <replica>
+            <host>clickhouse-4</host>
+            <port>9000</port>
+          </replica>
+        </shard>
+      </iam>
+    </remote_servers>
+
+
+Étape 4: Deployer Keycloak (3 instances)
+
+  Sur chaque nœud:
+    ssh keycloak-1.prod
+    cd /srv/pfe-sso
+    git clone ...
+    docker compose -f docker-compose.production.yml up -d
+    
+    (Répéter pour keycloak-2, keycloak-3)
+
+
+Étape 5: Deployer Event-Collector (3 instances)
+
+  Sur chaque nœud collector:
+    ssh collector-1.prod
+    cd /srv/pfe-sso
+    docker compose -f docker-compose.collector.yml up -d
+
+
+Étape 6: Configurer Monitoring
+
+  Prometheus scrape_configs:
+    - job_name: 'keycloak'
+      static_configs:
+        - targets: ['keycloak-1:8080', 'keycloak-2:8080', 'keycloak-3:8080']
+    
+    - job_name: 'clickhouse'
+      static_configs:
+        - targets: ['clickhouse-1:8123', 'clickhouse-2:8123']
+
+
+Étape 7: Configurer Backups
+
+  Backup PostgreSQL (quotidien):
+    0 2 * * * pg_dump -U keycloak_prod keycloak_prod | gzip | aws s3 cp - s3://backups/pfe-sso/pg-$(date +\%Y\%m\%d).sql.gz
+  
+  Backup ClickHouse (quotidien):
+    0 3 * * * clickhouse-client --query "BACKUP DATABASE iam TO S3 .../iam-$(date +\%Y\%m\%d).tar.gz"
+
+
+5.4 VALIDATION POST-DÉPLOIEMENT
+╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌
+
+Checklist:
+
+  ✓ Health check endpoints respondent
+    curl https://sso.company.com/.well-known/openid-configuration
+    curl https://sso.company.com:8088/
+  
+  ✓ SSL certificate valide
+    openssl s_client -connect sso.company.com:443
+  
+  ✓ Passwords forts changés (pas defaults)
+    Vérifier dans .env.production
+  
+  ✓ Logging centralisé actif
+    Vérifier ELK/Splunk reçoit les logs
+  
+  ✓ Monitoring + alertes configurées
+    Prometheus scrape les endpoints
+    Grafana affiche les dashboards
+  
+  ✓ Backups fonctionnent
+    Vérifier s3://backups contient fichiers
+  
+  ✓ Replication DB/ClickHouse OK
+    SELECT * FROM system.replication_queue;
+  
+  ✓ Load balancer round-robin fonctionne
+    curl https://sso.company.com (vérifier serveurs différents)
+  
+  ✓ Test d'authentification end-to-end
+    Login test depuis une app client
+    Vérifier événement dans ClickHouse
+
+
+================================================================================
+6. CONFIGURATION AVANCÉE
+================================================================================
+
+6.1 KUBERNETES DEPLOYMENT (OPTIONNEL)
+─────────────────────────────────────
+
+Créer kube-deployment.yaml:
+
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata:
+    name: keycloak
+    labels:
+      app: keycloak
+  spec:
+    replicas: 3
+    selector:
+      matchLabels:
+        app: keycloak
+    template:
+      metadata:
+        labels:
+          app: keycloak
+      spec:
+        containers:
+        - name: keycloak
+          image: quay.io/keycloak/keycloak:26.0.0
+          command: ["start"]
+          env:
+          - name: KC_DB
+            value: postgres
+          - name: KC_DB_URL
+            valueFrom:
+              secretKeyRef:
+                name: keycloak-secrets
+                key: db-url
+          - name: KC_PROXY
+            value: edge
+          ports:
+          - containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 5
+        volumes:
+        - name: providers
+          configMap:
+            name: keycloak-providers
+
+
+Deploy:
+  kubectl apply -f kube-deployment.yaml
+
+
+6.2 AUTO-SCALING
+─────────────────
+
+Docker Swarm auto-scaling:
+  docker service create --replicas 3 --name keycloak \
+    -e KC_DB=postgres \
+    -p 8080:8080 \
+    quay.io/keycloak/keycloak:26.0.0
+
+
+Kubernetes HPA:
+  apiVersion: autoscaling/v2
+  kind: HorizontalPodAutoscaler
+  metadata:
+    name: keycloak-hpa
+  spec:
+    scaleTargetRef:
+      apiVersion: apps/v1
+      kind: Deployment
+      name: keycloak
+    minReplicas: 3
+    maxReplicas: 10
+    metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+
+
+6.3 DISASTER RECOVERY
+──────────────────────
+
+RPO (Recovery Point Objective): 1 heure
+RTO (Recovery Time Objective): 30 minutes
+
+Stratégie:
+  - Backups incrémentaux toutes les heures
+  - Réplication cross-region
+  - Failover automatique via DNS
+
+
+Failover procedure:
+  1. Détecter perte de DC primaire
+  2. Promouvoir replicas secondaires
+  3. Mettre à jour DNS vers DC2
+  4. Notifier ops
+
+
+================================================================================
+7. MONITORING ET LOGS
+================================================================================
+
+7.1 PROMETHEUS METRICS
+──────────────────────
+
+Keycloak:
+  keycloak_sessions_active
+  keycloak_usersessionfrequency_millis_sum
+  keycloak_login_attempts_total
+  keycloak_login_errors_total
+
+Event-Collector:
+  http_requests_total
+  http_request_duration_seconds
+  clickhouse_insert_errors_total
+  events_enriched_total
+
+ClickHouse:
+  clickhouse_replicated_fetches
+  clickhouse_replicated_sends
+  clickhouse_read_buffers_allocated
+  clickhouse_memory_usage_bytes
+
+
+7.2 LOGS
+─────────
+
+Chemin logs:
+
+  Keycloak:
+    /var/log/keycloak/keycloak.log
+  
+  Event-Collector:
+    /var/log/pfesso/collector.log
+  
+  Nginx:
+    /var/log/nginx/access.log
+    /var/log/nginx/error.log
+
+
+ELK Stack Integration:
+
+  Filebeat collecte les logs
+    → Elasticsearch indexe
+    → Kibana affiche
+
+
+7.3 ALERTES (RECOMMANDÉES)
+────────────────────────────
+
+ ⚠️ Keycloak unhealthy
+    Condition: health endpoint répond pas 200
+    Action: Page on-call
+ 
+ ⚠️ Database slow queries
+    Condition: query time > 5s
+    Action: Warning sur Slack
+ 
+ ⚠️ ClickHouse replication lag
+    Condition: lag > 10 secondes
+    Action: Warning, check replicas
+ 
+ ⚠️ High risk_score events
+    Condition: risk_score > 80
+    Action: Alert SOC team
+ 
+ ⚠️ Disk space low
+    Condition: < 10% libre
+    Action: Critical alert + page
+
+
+================================================================================
+8. TROUBLESHOOTING
+================================================================================
+
+PROBLÈME 1: Keycloak ne démarre pas
+─────────────────────────────────────
+
+Symptôme:
+  docker logs pfe_keycloak shows: "Connection refused to postgres"
+
+Solutions:
+  1. Vérifier postgres démarre:
+     docker ps | grep postgres
+     docker logs pfe_postgres
+  
+  2. Vérifier env vars:
+     docker inspect pfe_keycloak | grep -A 20 Env
+  
+  3. Vérifier connectivité réseau:
+     docker exec pfe_keycloak ping postgres
+  
+  4. Attendre postgres startup:
+     Ajouter healthcheck dans docker-compose.yml
+     depends_on:
+       postgres:
+         condition: service_healthy
+
+
+PROBLÈME 2: X-Forwarded-For n'est pas capturé
+──────────────────────────────────────────────
+
+Symptôme:
+  event.ipAddress = 172.20.0.1 (gateway Docker) au lieu de la vraie IP
+
+Solutions:
+  1. Vérifier Nginx envoie le header:
+     curl -H "X-Forwarded-For: 203.113.44.55" http://localhost:8081/...
+  
+  2. Vérifier KC_PROXY=edge dans docker-compose.yml
+  
+  3. Vérifier dans logs du listener:
+     docker logs pfe_keycloak | grep "X-Forwarded-For"
+  
+  4. Recompiler le JAR et relancer:
+     cd keycloak-spi/kc-event-listener
+     mvn clean package
+     docker compose down && docker compose up -d --build
+
+
+PROBLÈME 3: Event-Collector ne reçoit pas d'événements
+──────────────────────────────────────────────────────
+
+Symptôme:
+  curl http://localhost:8088/events → erreur ou timeout
+
+Solutions:
+  1. Vérifier event-collector démarre:
+     docker ps | grep event-collector
+     docker logs pfesso-event-collector-1
+  
+  2. Vérifier PFE_COLLECTOR_URL dans Keycloak:
+     docker exec pfe_keycloak env | grep COLLECTOR
+     Doit être: http://event-collector:8088/events
+  
+  3. Vérifier connectivité Keycloak → Collector:
+     docker exec pfe_keycloak curl http://event-collector:8088/
+  
+  4. Vérifier SPI en cours d'exécution:
+     docker logs pfe_keycloak | grep RiskListener
+
+
+PROBLÈME 4: ClickHouse plein / pas d'espace
+────────────────────────────────────────────
+
+Symptôme:
+  Event-collector: "INSERT error: No space left on device"
+
+Solutions:
+  1. Vérifier espace disque:
+     docker exec pfe_clickhouse df -h
+  
+  2. Purger vieilles données:
+     docker exec pfe_clickhouse clickhouse-client --query \
+       "ALTER TABLE iam.login_events DELETE WHERE event_time < now() - INTERVAL 90 DAY"
+  
+  3. Augmenter disque:
+     Redimensionner le volume Docker
+     docker volume inspect ...
+
+
+PROBLÈME 5: Performance lente
+──────────────────────────────
+
+Symptôme:
+  /events endpoint prend > 10 secondes
+
+Possibles causes:
+  1. APIs externes lentes (AbuseIPDB, GeoLite2)
+     → Augmenter cache TTL
+     → Utiliser moins de sources
+  
+  2. ClickHouse lent
+     → Vérifier CPU/RAM du conteneur
+     → Optimiser les indexes
+     → Activer la compression
+  
+  3. Réseau congestionné
+     → Vérifier docker stats
+     → Commiter les ressources allouées
+
+
+PROBLÈME 6: Certificat SSL expiré
+────────────────────────────────────
+
+Symptôme:
+  curl https://sso.company.com: certificate verify failed
+
+Solution:
+  1. Renouveler le certificat (Let's Encrypt):
+     certbot renew
+  
+  2. Redéployer:
+     docker compose down
+     docker compose up -d
+
+
+================================================================================
+CHECKLIST FINAL DE DÉPLOIEMENT
+================================================================================
+
+Avant chaque déploiement, vérifier:
+
+PRÉPARATION:
+  ☑ Code committé et pushé
+  ☑ Tests locaux passent (docker compose up)
+  ☑ .env.staging / .env.production rempli
+  ☑ Secrets sécurisés (pas en git)
+  ☑ Certificats SSL valides
+  ☑ Backups récents en place
+
+DÉPLOIEMENT:
+  ☑ Notifier l'équipe (Slack/Email)
+  ☑ Mode maintenance activé si nécessaire
+  ☑ Compiler SPI Keycloak
+  ☑ Pull/build nouvelles images Docker
+  ☑ Lancer: docker compose up -d --build
+  ☑ Attendre démarrage complet (logs sains)
+  ☑ Vérifier health checks
+  ☑ Tester login end-to-end
+  ☑ Vérifier logs (pas d'erreurs)
+  ☑ Vérifier ClickHouse a des événements
+
+POST-DÉPLOIEMENT:
+  ☑ Monitorer les métriques 30 min
+  ☑ Documenter les changements
+  ☑ Notifier déploiement terminé avec succès
+  ☑ Plannifier rollback si problème
+
+
+================================================================================
+[FIN DU GUIDE DE DÉPLOIEMENT]
+================================================================================
+
+
+
+
+
+
+
+
+
+
+
+cloudflared tunnel --url http://localhost:8081
+  ta5oou lien temchy li .env fi SP tebadel kc_base url we t7ot url jedid 
+
+cloudflared tunnel --url http://localhost:4005
+ ta5ou url jedid we temchi li portal/server.js we tebadel url jedid fi const APP_BASE_URL 
+
+ ba3ed dcker compose down ---> docker compose up -d 

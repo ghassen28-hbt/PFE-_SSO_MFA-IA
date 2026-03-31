@@ -1,0 +1,1321 @@
+================================================================================
+                   CLICKHOUSE FEATURES & DATA WAREHOUSE
+        Gestion Complète des Données d'Authentification et d'Enrichissement
+================================================================================
+
+TABLE DES MATIÈRES
+================================================================================
+1. Vue d'ensemble de la table login_events
+2. Détail de toutes les features (50+ colonnes)
+3. Exemples de requêtes pour récupérer les données
+4. Dashboards d'analyse recommandés
+5. Optimisations et indexation
+6. Features futures à ajouter
+
+
+================================================================================
+1. VUE D'ENSEMBLE DE LA TABLE LOGIN_EVENTS
+================================================================================
+
+Database: iam
+Table: login_events
+Engine: MergeTree
+Partitionning: event_time (par jour)
+Order by: (event_time, user_id, realm)
+
+Statistiques (exemple):
+  - ~50-100 millions d'événements par an (pour 10k utilisateurs actifs)
+  - Taille compressée: ~50-100 GB par an
+  - Taille non compressée: ~500-1000 GB par an
+  - Compression ratio: 10:1
+
+Rétention: 
+  - Hot (0-30 jours): Accès rapide
+  - Warm (30-90 jours): Compressé
+  - Cold (> 90 jours): Archive S3
+
+
+================================================================================
+2. DÉTAIL DE TOUTES LES FEATURES (50+ COLONNES)
+================================================================================
+
+
+GROUPE 1: IDENTIFIANTS & CONTEXTE (8 colonnes)
+═══════════════════════════════════════════════
+
+1. event_time (DateTime)
+   ├─ Type: DateTime (UTC)
+   ├─ Format: YYYY-MM-DD HH:MM:SS
+   ├─ Exemples: "2026-03-11 14:30:45"
+   ├─ Utilité: Timestamp de l'événement
+   ├─ Index: OUI (partition key)
+   └─ Notes: Primary ordering, crucial pour les time-series queries
+
+2. realm (String)
+   ├─ Type: Énumération (dans notre cas: "PFE-SSO")
+   ├─ Longueur: 10-50 caractères
+   ├─ Exemples: "PFE-SSO", "customers-realm", "partners-realm"
+   ├─ Utilité: Identifier le realm Keycloak
+   ├─ Index: OUI (ORDER BY)
+   └─ Notes: Permet multi-tenant
+
+3. client_id (String)
+   ├─ Type: String (Keycloak client ID)
+   ├─ Exemples: "admin-console-client-1", "hr-client-4", "finance-client-3"
+   ├─ Longueur: 20-50 caractères
+   ├─ Utilité: Identifier l'application source de l'authentification
+   ├─ Mapping:
+   │  ├─ admin-console-client-1 (sensibilité: 5)
+   │  ├─ hr-client-4 (sensibilité: 3)
+   │  ├─ finance-client-3 (sensibilité: 4)
+   │  ├─ crm-client-2 (sensibilité: 2)
+   │  └─ portal-client-5 (sensibilité: 1)
+   └─ Utilité: Audit par app, alertes si app sensible
+
+4. user_id (String)
+   ├─ Type: String (UUID ou username)
+   ├─ Exemples: "user-123", "550e8400-e29b-41d4-a716-446655440000"
+   ├─ Longueur: 20-50 caractères
+   ├─ Utilité: Identifier l'utilisateur
+   ├─ Partitioning: Secondary ORDER BY
+   └─ Notes: Clé pour join avec table users externes
+
+5. username (String)
+   ├─ Type: String (email ou nom d'utilisateur)
+   ├─ Exemples: "hassan.tounsi@company.com", "hassan", "user-123"
+   ├─ Longueur: 10-100 caractères
+   ├─ Utilité: Nom lisible pour audit
+   └─ Notes: Peut changer, user_id est stable
+
+6. event_type (String)
+   ├─ Type: Énumération
+   ├─ Valeurs possibles:
+   │  ├─ LOGIN (succès)
+   │  ├─ LOGIN_ERROR (échec)
+   │  ├─ LOGOUT
+   │  ├─ UPDATE_PASSWORD
+   │  ├─ UPDATE_TOTP
+   │  ├─ REMOVE_TOTP
+   │  └─ REGISTER
+   ├─ Utilité: Classifier les événements
+   └─ Exemples requêtes:
+     SELECT event_type, COUNT(*) FROM login_events GROUP BY event_type
+
+7. error (String)
+   ├─ Type: String (message d'erreur ou vide)
+   ├─ Exemples:
+   │  ├─ "" (succès, pas d'erreur)
+   │  ├─ "Invalid credentials"
+   │  ├─ "User not found"
+   │  ├─ "Account locked"
+   │  └─ "MFA failed"
+   ├─ Longueur: 0-200 caractères
+   └─ Utilité: Diagnostiquer les problèmes d'auth
+
+8. session_id (String)
+   ├─ Type: String (UUID Keycloak session)
+   ├─ Longueur: 30-50 caractères
+   ├─ Utilité: Tracker la session utilisateur
+   └─ Notes: Permet de corréler mulitples eventos
+
+════════════════════════════════════════════════════════
+
+
+GROUPE 2: IP & RÉSEAU (3 colonnes)
+══════════════════════════════════
+
+9. ip (String)
+   ├─ Type: String (IPv4)
+   ├─ Format: XXX.XXX.XXX.XXX
+   ├─ Exemples:
+   │  ├─ 203.113.44.55 (publique réelle)
+   │  ├─ 8.8.8.8 (DNS Google)
+   │  ├─ 172.20.0.1 (gateway Docker, privée)
+   │  └─ 185.220.100.1 (Tor exit node)
+   ├─ Extraction:
+   │  1. Header X-Forwarded-For (Nginx)
+   │  2. Field http_x_forwarded_for (Keycloak)
+   │  3. Field ipAddress (événement brut)
+   │  4. Client IP brut (fallback)
+   ├─ Utilité: Tracking géographique, threat intel
+   └─ Index: Low priority (pas queryée seule souvent)
+
+10. is_public_ip (UInt8)
+    ├─ Type: Boolean (0=private, 1=public)
+    ├─ Valeurs: 0 ou 1
+    ├─ Exemples:
+    │  ├─ 0 si IP = 172.20.x.x (privée Docker)
+    │  ├─ 0 si IP = 192.168.x.x
+    │  ├─ 0 si IP = 10.x.x.x
+    │  ├─ 1 si IP = 203.113.44.55
+    │  └─ 1 si IP = 8.8.8.8
+    ├─ Calcul:
+    │  def is_public_ip(ip):
+    │      addr = ipaddress.ip_address(ip)
+    │      return addr.is_global
+    ├─ Utilité: Filtrer les accès internes vs externes
+    └─ Queries:
+      SELECT COUNT(*) FROM login_events WHERE is_public_ip = 1
+
+════════════════════════════════════════════════════════
+
+
+GROUPE 3: USER-AGENT & DEVICE (6 colonnes)
+═════════════════════════════════════════
+
+11. ua_raw (String)
+    ├─ Type: String (brut User-Agent header)
+    ├─ Format: Mozilla/5.0 (...)
+    ├─ Exemples:
+    │  ├─ "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0"
+    │  ├─ "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Safari/537.36"
+    │  ├─ "Mozilla/5.0 (Linux; Android 12) Chrome/120.0"
+    │  └─ "" (si absente)
+    ├─ Longueur: 0-500 caractères
+    ├─ Mise à jour: Parsée avec librairie `user-agents`
+    └─ Utilité: Debug, reverse engineering d'attaques
+
+12. ua_browser (String)
+    ├─ Type: String (parsée)
+    ├─ Format: "{Browser} {Version}"
+    ├─ Exemples:
+    │  ├─ "Chrome 120.0"
+    │  ├─ "Safari 537.36"
+    │  ├─ "Firefox 121.0"
+    │  ├─ "Edge 120.0"
+    │  └─ "Unknown"
+    ├─ Parsing:
+    │  from user_agents import parse
+    │  ua = parse(ua_raw)
+    │  ua_browser = f"{ua.browser.family} {ua.browser.version_string}"
+    ├─ Utilité: Identifier le navigateur utilisé
+    └─ Queries:
+      SELECT ua_browser, COUNT(*) FROM login_events 
+      GROUP BY ua_browser ORDER BY COUNT(*) DESC
+
+13. ua_os (String)
+    ├─ Type: String (parsée)
+    ├─ Format: "{OS} {Version}"
+    ├─ Exemples:
+    │  ├─ "Windows 10"
+    │  ├─ "macOS 13.5"
+    │  ├─ "Android 12"
+    │  ├─ "iOS 16.7"
+    │  └─ "Linux"
+    ├─ Parsing:
+    │  ua_os = f"{ua.os.family} {ua.os.version_string}"
+    ├─ Utilité: Audit de sécurité (e.g., corporate policies)
+    └─ Queries:
+      SELECT ua_os, COUNT(*) FROM login_events 
+      WHERE user_id = 'user-123' GROUP BY ua_os
+
+14. ua_device (String)
+    ├─ Type: Énumération
+    ├─ Valeurs:
+    │  ├─ "pc" (desktop/laptop)
+    │  ├─ "mobile" (smartphone)
+    │  ├─ "tablet" (iPad, etc.)
+    │  └─ "other"
+    ├─ Logique:
+    │  if ua.is_mobile: ua_device = "mobile"
+    │  elif ua.is_tablet: ua_device = "tablet"
+    │  elif ua.is_pc: ua_device = "pc"
+    │  else: ua_device = "other"
+    ├─ Utilité: Audit d'utilisation par type d'appareil
+    └─ Queries:
+      SELECT ua_device, COUNT(*) FROM login_events 
+      GROUP BY ua_device
+
+15. device_fp (String)
+    ├─ Type: String (SHA-256 hash)
+    ├─ Format: Hexadécimal (64 caractères)
+    ├─ Exemple: "6f8885d65bdc2a5ca55fcfdc95384d0bc90195deb4ee7767f67905cf5120cc68"
+    ├─ Calcul:
+    │  def device_fingerprint(ua_raw, ip):
+    │      base = (ua_raw or "") + "|" + (ip or "")
+    │      return hashlib.sha256(base.encode()).hexdigest()
+    ├─ Utilité: Détecter les changements d'appareil utilisateur
+    ├─ Confidentialité: Hash non réversible
+    └─ Queries:
+      SELECT device_fp, COUNT(*) FROM login_events 
+      WHERE user_id = 'user-123' GROUP BY device_fp
+
+16. is_new_device (UInt8)
+    ├─ Type: Boolean (0=connu, 1=nouveau)
+    ├─ Calcul:
+    │  def is_new_device(user_id, device_fp):
+    │      existing = query(f"SELECT COUNT(*) FROM login_events 
+    │                        WHERE user_id = '{user_id}' AND device_fp = '{device_fp}'")
+    │      return 1 if existing == 0 else 0
+    ├─ Utilité: Détecter les accès from suspicious devices
+    ├─ Risk scoring: +10 points si nouveau device
+    └─ Queries:
+      SELECT user_id, device_fp FROM login_events 
+      WHERE user_id = 'user-123' AND is_new_device = 1
+
+════════════════════════════════════════════════════════
+
+
+GROUPE 4: TEMPOREL (7 colonnes)
+═══════════════════════════════
+
+17. hour (UInt8)
+    ├─ Type: UInt8 (0-23)
+    ├─ Exemples: 0 (minuit), 14 (14h), 22 (22h)
+    ├─ Calcul:
+    │  hour = event_time.hour
+    ├─ Utilité: Détecter comportements anormaux par heure
+    └─ Queries:
+      SELECT hour, COUNT(*) FROM login_events 
+      GROUP BY hour ORDER BY hour
+
+18. day_of_week (UInt8)
+    ├─ Type: UInt8 (0-6)
+    ├─ Mapping:
+    │  ├─ 0 = Monday
+    │  ├─ 1 = Tuesday
+    │  ├─ 2 = Wednesday
+    │  ├─ 3 = Thursday
+    │  ├─ 4 = Friday
+    │  ├─ 5 = Saturday
+    │  └─ 6 = Sunday
+    ├─ Calcul:
+    │  day_of_week = event_time.weekday()
+    ├─ Utilité: Patterns de travail (business days vs weekends)
+    └─ Queries:
+      SELECT day_of_week, COUNT(*) FROM login_events 
+      GROUP BY day_of_week
+
+19. is_weekend (UInt8)
+    ├─ Type: Boolean (0=semaine, 1=weekend)
+    ├─ Calcul:
+    │  is_weekend = 1 if day_of_week in [5, 6] else 0
+    ├─ Utilité: Alertes sur accès hors heures de travail
+    ├─ Risk scoring: Potentiel +5 si rarement en weekend
+    └─ Queries:
+      SELECT COUNT(*) FROM login_events 
+      WHERE user_id = 'user-123' AND is_weekend = 1
+
+20. is_night_login (UInt8)
+    ├─ Type: Boolean (1 si 22h-6h, 0 sinon)
+    ├─ Calcul:
+    │  is_night_login = 1 if hour >= 22 or hour <= 6 else 0
+    ├─ Utilité: Détecter activité nocturne suspecte
+    ├─ Risk scoring: +5 points si night login
+    └─ Queries:
+      SELECT COUNT(*) FROM login_events 
+      WHERE is_night_login = 1 AND event_type = 'LOGIN'
+
+21. is_business_hours (UInt8)
+    ├─ Type: Boolean (1 si 8h-18h, 0 sinon)
+    ├─ Calcul:
+    │  is_business_hours = 1 if 8 <= hour <= 18 and is_weekend == 0 else 0
+    ├─ Utilité: Comportement normal vs anomalies
+    └─ Queries:
+      SELECT COUNT(*) FROM login_events 
+      WHERE user_id = 'user-123' AND is_business_hours = 0
+
+════════════════════════════════════════════════════════
+
+
+GROUPE 5: HISTORIQUES & CONTEXTE (6 colonnes)
+═══════════════════════════════════════════════
+
+22. fails_5m (UInt32)
+    ├─ Type: Compteur (0 à ~1000)
+    ├─ Signification: Nombre d'échecs de login en 5 min pour cet user
+    ├─ Calcul:
+    │  SELECT COUNT(*) FROM login_events 
+    │  WHERE user_id = ? AND event_type = 'LOGIN_ERROR'
+    │    AND event_time >= NOW() - INTERVAL 5 MINUTE
+    ├─ Utilité: Détecter brute force attacks rapides
+    ├─ Risk scoring: +20 points si >= 3 fails en 5 min
+    └─ Queries:
+      SELECT user_id, fails_5m FROM login_events 
+      WHERE fails_5m >= 3 LIMIT 10
+
+23. fails_1h (UInt32)
+    ├─ Type: Compteur (0 à ~10000)
+    ├─ Signification: Nombre d'échecs de login en 1h pour cet user
+    ├─ Calcul:
+    │  SELECT COUNT(*) FROM login_events 
+    │  WHERE user_id = ? AND event_type = 'LOGIN_ERROR'
+    │    AND event_time >= NOW() - INTERVAL 1 HOUR
+    ├─ Utilité: Détecter brute force attacks medium-term
+    ├─ Risk scoring: +15 points si >= 5 fails en 1h
+    └─ Queries:
+      SELECT user_id, COUNT(*) FROM login_events 
+      WHERE fails_1h >= 5 GROUP BY user_id
+
+24. fails_24h (UInt32)
+    ├─ Type: Compteur (0 à ~100000)
+    ├─ Signification: Nombre d'échecs de login en 24h pour cet user
+    ├─ Calcul:
+    │  SELECT COUNT(*) FROM login_events 
+    │  WHERE user_id = ? AND event_type = 'LOGIN_ERROR'
+    │    AND event_time >= NOW() - INTERVAL 24 HOUR
+    ├─ Utilité: Trend long-term, décision lock account
+    └─ Queries:
+      SELECT user_id, fails_24h FROM login_events 
+      WHERE fails_24h > 50 AND event_time > NOW() - INTERVAL 1 HOUR
+
+25. login_1h (UInt32)
+    ├─ Type: Compteur (0 à ~100)
+    ├─ Signification: Nombre de LOGINs réussis en 1h pour cet user
+    ├─ Calcul:
+    │  SELECT COUNT(*) FROM login_events 
+    │  WHERE user_id = ? AND event_type = 'LOGIN'
+    │    AND event_time >= NOW() - INTERVAL 1 HOUR
+    ├─ Utilité: Détecter multi-login anormal (session hijacking?)
+    └─ Queries:
+      SELECT user_id FROM login_events 
+      WHERE login_1h > 10 (possiblement suspecte)
+
+26. event_success (UInt8)
+    ├─ Type: Boolean (1=LOGIN success, 0=échec ou autre)
+    ├─ Calcul:
+    │  event_success = 1 if event_type == 'LOGIN' and error == '' else 0
+    ├─ Utilité: Statistiques de succès/taux d'erreur
+    └─ Queries:
+      SELECT user_id, 
+             SUM(event_success) as successes,
+             COUNT(*) - SUM(event_success) as failures
+      FROM login_events
+      WHERE event_time >= NOW() - INTERVAL 7 DAY
+      GROUP BY user_id
+
+27. app_sensitivity (UInt8)
+    ├─ Type: 0-5 (sensibilité de l'app)
+    ├─ Mapping:
+    │  ├─ portal-client-5: 1 (faible)
+    │  ├─ crm-client-2: 2
+    │  ├─ hr-client-4: 3
+    │  ├─ finance-client-3: 4
+    │  └─ admin-console-client-1: 5 (très sensible)
+    ├─ Utilité: Appliquer règles MFA strictes pour apps critiques
+    ├─ Risk scoring: +10 points si app_sensitivity >= 4
+    └─ Queries:
+      SELECT client_id, app_sensitivity FROM login_events 
+      WHERE risk_score >= 60
+
+════════════════════════════════════════════════════════
+
+
+GROUPE 6: ABUSEIPDB (7 colonnes)
+════════════════════════════════
+
+28. abuse_score (UInt8)
+    ├─ Type: 0-100 (score de confiance d'abus)
+    ├─ Source: API AbuseIPDB
+    ├─ Exemples:
+    │  ├─ 0 (IP propre)
+    │  ├─ 25 (suspectée)
+    │  ├─ 75 (très suspecte)
+    │  └─ 100 (connue mauvaise)
+    ├─ Utilité: Threat scoring principal
+    ├─ Risk scoring:
+    │  ├─ +40 si abuse_score >= 75
+    │  ├─ +25 si abuse_score >= 40
+    │  └─ +10 si abuse_score > 0
+    └─ Queries:
+      SELECT COUNT(*) FROM login_events WHERE abuse_score > 50
+
+29. ip_reports (UInt32)
+    ├─ Type: Compteur
+    ├─ Source: Total reports sur l'IP dans AbuseIPDB
+    ├─ Exemples: 0, 50, 500, 5000+
+    ├─ Utilité: Volume de signalements
+    └─ Queries:
+      SELECT ip, abuse_score, ip_reports FROM login_events 
+      ORDER BY ip_reports DESC LIMIT 10
+
+30. abuse_usage_type (String)
+    ├─ Type: Catégorie
+    ├─ Exemples:
+    │  ├─ "Data Center"
+    │  ├─ "Content Delivery Network"
+    │  ├─ "Fixed Line ISP"
+    │  ├─ "Mobile ISP"
+    │  ├─ "Hosting Provider"
+    │  └─ "Residential"
+    ├─ Utilité: Contextualiser la nature de l'IP
+    └─ Queries:
+      SELECT abuse_usage_type, COUNT(*) FROM login_events 
+      GROUP BY abuse_usage_type
+
+31. abuse_isp (String)
+    ├─ Type: Nom ISP
+    ├─ Exemples:
+    │  ├─ "Google LLC"
+    │  ├─ "Cloudflare Inc"
+    │  ├─ "Amazon Web Services"
+    │  ├─ "TOT public company limited"
+    │  └─ "Vodafone Italy"
+    ├─ Longueur: 20-100 caractères
+    ├─ Utilité: Identifier provider
+    └─ Queries:
+      SELECT abuse_isp, COUNT(*) FROM login_events 
+      GROUP BY abuse_isp ORDER BY COUNT(*) DESC
+
+32. abuse_country_code (String)
+    ├─ Type: ISO 3166-1 alpha-2 code
+    ├─ Format: 2 caractères
+    ├─ Exemples: "US", "FR", "TH", "CN", "RU"
+    ├─ Utilité: Filtrer par pays (data residency)
+    └─ Queries:
+      SELECT abuse_country_code, COUNT(*) FROM login_events 
+      WHERE risk_score >= 60 GROUP BY abuse_country_code
+
+33. abuse_last_reported_at (String)
+    ├─ Type: DateTime (ISO 8601)
+    ├─ Format: "2026-03-10T22:20:54+00:00"
+    ├─ Utilité: Savoir si dernière activité suspecte récente
+    └─ Queries:
+      SELECT ip, abuse_last_reported_at FROM login_events 
+      WHERE abuse_score > 0 ORDER BY abuse_last_reported_at DESC
+
+════════════════════════════════════════════════════════
+
+
+GROUPE 7: TOR (1 colonne)
+═════════════════════════
+
+34. is_tor (UInt8)
+    ├─ Type: Boolean (0=non Tor, 1=Tor exit node)
+    ├─ Source: Tor Project Bulk Exit List
+    ├─ Refresh: Toutes les 6 heures
+    ├─ Calcul:
+    │  is_tor = 1 if ip in tor_exit_nodes_set else 0
+    ├─ Utilité: Bloquer/Alerter sur accès Tor
+    ├─ Risk scoring: +35 points si Tor detecté
+    └─ Queries:
+      SELECT COUNT(*) FROM login_events WHERE is_tor = 1
+      SELECT user_id, COUNT(*) FROM login_events 
+      WHERE is_tor = 1 GROUP BY user_id
+
+════════════════════════════════════════════════════════
+
+
+GROUPE 8: GREYNOISE (3 colonnes)
+════════════════════════════════
+
+35. greynoise_noise (UInt8)
+    ├─ Type: Boolean (0=non noise, 1=internet noise/scanning)
+    ├─ Source: GreyNoise Community API
+    ├─ Signification: IP fait du scanning/fuzzing réseau
+    ├─ Utilité: Filtrer les faux positifs
+    ├─ Risk scoring: +15 points si noise detecté
+    └─ Queries:
+      SELECT COUNT(*) FROM login_events WHERE greynoise_noise = 1
+
+36. greynoise_riot (UInt8)
+    ├─ Type: Boolean (0=pas RIOT, 1=RIOT - benign service)
+    ├─ Source: GreyNoise RIOT (Recognized IT Operations)
+    ├─ Exemples: Microsoft, Google, GitHub runners
+    ├─ Utilité: Whitelist les faux positifs
+    └─ Queries:
+      SELECT COUNT(*) FROM login_events 
+      WHERE greynoise_riot = 1 AND greynoise_noise = 1
+
+37. greynoise_classification (String)
+    ├─ Type: Énumération
+    ├─ Valeurs:
+    │  ├─ "" (pas classifiée)
+    │  ├─ "malicious"
+    │  ├─ "suspicious"
+    │  └─ "benign"
+    ├─ Utilité: Classification de la menace
+    └─ Queries:
+      SELECT greynoise_classification, COUNT(*) FROM login_events 
+      GROUP BY greynoise_classification
+
+════════════════════════════════════════════════════════
+
+
+GROUPE 9: VIRUSTOTAL (3 colonnes)
+═════════════════════════════════
+
+38. vt_malicious (UInt8)
+    ├─ Type: Compteur (0-N vendors malveillant)
+    ├─ Source: VirusTotal API
+    ├─ Signification: Nombre de vendors détectant l'IP comme malveillante
+    ├─ Utilité: Consensus threat intelligence
+    ├─ Risk scoring: +20 points si vt_malicious > 0
+    └─ Queries:
+      SELECT COUNT(*) FROM login_events WHERE vt_malicious >= 2
+
+39. vt_suspicious (UInt8)
+    ├─ Type: Compteur
+    ├─ Signification: Nombre de vendors trouvant l'IP suspecte
+    ├─ Utilité: Medium confidence threat signal
+    └─ Queries:
+      SELECT ip, vt_malicious, vt_suspicious FROM login_events 
+      WHERE vt_malicious + vt_suspicious >= 3
+
+40. vt_reputation (Int32)
+    ├─ Type: Score de réputation
+    ├─ Range: -100 à +100
+    ├─ Negativ values = mauvaise réputation
+    ├─ Positif values = bonne réputation
+    ├─ Utilité: Metric aggrégée VirusTotal
+    └─ Queries:
+      SELECT ip, vt_reputation FROM login_events 
+      ORDER BY vt_reputation ASC LIMIT 10
+
+════════════════════════════════════════════════════════
+
+
+GROUPE 10: GEOLITE2 (8 colonnes)
+════════════════════════════════
+
+41. geo_country (String)
+    ├─ Type: Pays (nom complet)
+    ├─ Exemples:
+    │  ├─ "United States"
+    │  ├─ "Thailand"
+    │  ├─ "France"
+    │  ├─ "China"
+    │  └─ ""
+    ├─ Longueur: 20-50 caractères
+    ├─ Source: GeoLite2 Database (local)
+    ├─ Utilité: Geofencing, compliance (data residency)
+    └─ Queries:
+      SELECT geo_country, COUNT(*) FROM login_events 
+      GROUP BY geo_country ORDER BY COUNT(*) DESC
+
+42. geo_country_code (String)
+    ├─ Type: ISO 3166-1 alpha-2
+    ├─ Format: 2 caractères
+    ├─ Exemples: "US", "TH", "FR", "CN"
+    ├─ Utilité: Join avec data sources externes
+    └─ Queries:
+      SELECT DISTINCT geo_country_code FROM login_events 
+      WHERE user_id = 'user-123' ORDER BY event_time DESC
+
+43. geo_city (String)
+    ├─ Type: Nom de ville
+    ├─ Exemples:
+    │  ├─ "Bangkok"
+    │  ├─ "San Francisco"
+    │  ├─ "Paris"
+    │  └─ ""
+    ├─ Longueur: 20-50 caractères
+    ├─ Utilité: Analyse granulaire de localisation
+    └─ Queries:
+      SELECT geo_country, geo_city, COUNT(*) FROM login_events 
+      WHERE user_id = 'user-123' GROUP BY geo_country, geo_city
+
+44. geo_postal_code (String)
+    ├─ Type: Code postal
+    ├─ Exemples: "10110", "94102", "75001"
+    ├─ Longueur: 5-10 caractères
+    ├─ Utilité: Très granulaire, rarement utilisé
+    └─ Queries:
+      SELECT geo_postal_code FROM login_events 
+      WHERE geo_country = 'United States' LIMIT 10
+
+45. geo_latitude (Float32)
+    ├─ Type: Latitude
+    ├─ Range: -90.0 à +90.0
+    ├─ Exemples: 13.7442 (Bangkok), 37.7749 (SF)
+    ├─ Precision: 4 décimales (~10 km)
+    ├─ Utilité: Calcul distance, mapping
+    └─ Queries:
+      SELECT ip, geo_latitude, geo_longitude FROM login_events 
+      WHERE user_id = 'user-123' LIMIT 5
+
+46. geo_longitude (Float32)
+    ├─ Type: Longitude
+    ├─ Range: -180.0 à +180.0
+    ├─ Exemples: 100.4608 (Bangkok), -122.4194 (SF)
+    ├─ Precision: 4 décimales (~10 km)
+    ├─ Utilité: Calcul distance, mapping
+    └─ Queries:
+      SELECT ip, geo_latitude, geo_longitude FROM login_events 
+      WHERE user_id = 'user-123' LIMIT 5
+
+47. geo_timezone (String)
+    ├─ Type: IANA Timezone
+    ├─ Exemples:
+    │  ├─ "Asia/Bangkok"
+    │  ├─ "America/Los_Angeles"
+    │  ├─ "Europe/Paris"
+    │  └─ ""
+    ├─ Longueur: 20-40 caractères
+    ├─ Utilité: Contextualiser heure de connexion
+    └─ Queries:
+      SELECT geo_timezone, hour, COUNT(*) FROM login_events 
+      WHERE user_id = 'user-123' GROUP BY geo_timezone, hour
+
+════════════════════════════════════════════════════════
+
+
+GROUPE 11: SCORING DE RISQUE (3 colonnes)
+═══════════════════════════════════════════
+
+48. risk_score (UInt8)
+    ├─ Type: 0-100 (score de risque heuristique)
+    ├─ Calcul: Règles de scoring (voir doc principale)
+    ├─ Seuils clés:
+    │  ├─ 0-30: Risk faible
+    │  ├─ 31-60: Risk modéré
+    │  ├─ 61-80: Risk élevé
+    │  └─ 81-100: Risk très élevé
+    ├─ Utilité: Principal indicateur de sécurité
+    ├─ MFA trigger: >= 60
+    └─ Queries:
+      SELECT COUNT(*) FROM login_events WHERE risk_score >= 60
+      SELECT percentile as p, risk_score FROM login_events 
+      GROUP BY risk_score ORDER BY risk_score DESC
+
+49. risk_reasons (String)
+    ├─ Type: JSON Array (serialisé string)
+    ├─ Format: '["REASON1", "REASON2", ...]'
+    ├─ Exemples:
+    │  ├─ '["NEW_DEVICE", "NIGHT_LOGIN"]'
+    │  ├─ '["TOR_EXIT_NODE", "VERY_HIGH_ABUSE_SCORE"]'
+    │  ├─ '["MULTIPLE_FAILS_5M"]'
+    │  └─ '[]'
+    ├─ Raisons possibles:
+    │  ├─ TOR_EXIT_NODE
+    │  ├─ NON_PUBLIC_IP
+    │  ├─ VERY_HIGH_ABUSE_SCORE
+    │  ├─ HIGH_ABUSE_SCORE
+    │  ├─ NON_ZERO_ABUSE_SCORE
+    │  ├─ GREYNOISE_NOISE
+    │  ├─ VT_MALICIOUS
+    │  ├─ NEW_DEVICE
+    │  ├─ MULTIPLE_FAILS_5M
+    │  ├─ MULTIPLE_FAILS_1H
+    │  ├─ SENSITIVE_APP
+    │  └─ NIGHT_LOGIN
+    ├─ Utilité: Diagnostic et audit
+    └─ Queries:
+      SELECT risk_reasons FROM login_events 
+      WHERE risk_score >= 80
+
+50. step_up_required (UInt8)
+    ├─ Type: Boolean (0=non, 1=oui)
+    ├─ Calcul:
+    │  step_up_required = 1 if risk_score >= 60 else 0
+    ├─ Utilité: Flag pour Keycloak -> force MFA
+    ├─ Keycloak action:
+    │  if step_up_required == 1:
+    │      ForceRequiredAction(user, "VERIFY_PROFILE" ou "UPDATE_PASSWORD")
+    ├─ Pourcentage típico: 5-15% des logins
+    └─ Queries:
+      SELECT COUNT(*) as total,
+             SUM(step_up_required) as mfa_required
+      FROM login_events
+      WHERE event_type = 'LOGIN'
+
+════════════════════════════════════════════════════════
+
+
+GROUPE 12: JSON ENRICHMENT (1 colonne)
+═══════════════════════════════════════
+
+51. ip_enrichment_json (String)
+    ├─ Type: JSON string (complet)
+    ├─ Contenu: Dump entier de l'enrichissement
+    ├─ Exemple:
+    │  {
+    │    "ip": "203.113.44.55",
+    │    "is_public_ip": true,
+    │    "is_tor_bulk": false,
+    │    "abuseipdb": {
+    │      "abuse_score": 5,
+    │      "isp": "TOT public company limited",
+    │      ...
+    │    },
+    │    "greynoise": {...},
+    │    "virustotal": {...},
+    │    "geolite2": {...},
+    │    "risk_flags": ["GEO_TH"]
+    │  }
+    ├─ Utilité: Archive complète pour debug
+    ├─ Avantages: Permet upgrades schema sans migration
+    └─ Queries: Rarement queryée (backup only)
+
+
+════════════════════════════════════════════════════════
+
+RÉSUMÉ DES 51 COLONNES ACTUELLES + 35 NOUVELLES = 86 COLONNES
+
+Catégorie                   | Actuelles | Nouvelles | Total
+────────────────────────────┼───────────┼───────────┼─────────
+Identifiants & Contexte     | 8         | 0         | 8
+IP & Réseau                 | 3         | 0         | 3
+User-Agent & Device         | 6         | 0         | 6
+Temporel                    | 7         | 0         | 7
+Historiques & Contexte      | 6         | 0         | 6
+AbuseIPDB                   | 7         | 0         | 7
+Tor                         | 1         | 0         | 1
+GreyNoise                   | 3         | 0         | 3
+VirusTotal                  | 3         | 0         | 3
+GeoLite2                    | 8         | 0         | 8
+Scoring de Risque           | 3         | 0         | 3
+JSON Enrichment             | 1         | 0         | 1
+Contexte Avancé             | 0         | 8         | 8
+Comportement & Anomalies    | 0         | 6         | 6
+Machine Learning            | 0         | 4         | 4
+MFA Avancé                  | 0         | 4         | 4
+Sécurité Avancée            | 0         | 4         | 4
+Prédictif                   | 0         | 2         | 2
+Conformité & Légal          | 0         | 3         | 3
+Intégration Externe         | 0         | 3         | 3
+────────────────────────────┴───────────┴───────────┴─────────
+
+TOTAL: 51 + 35 = 86 colonnes
+
+
+================================================================================
+3. EXEMPLES DE REQUÊTES POUR RÉCUPÉRER LES DONNÉES
+================================================================================
+
+3.1 REQUÊTES D'AUDIT BASIQUES
+────────────────────────────
+
+# Tous les logins d'aujourd'hui
+SELECT event_time, username, ip, geo_country, event_type, risk_score
+FROM login_events
+WHERE event_time >= TODAY()
+ORDER BY event_time DESC
+LIMIT 1000;
+
+# Logins réussis (succès)
+SELECT COUNT(*) as total_logins
+FROM login_events
+WHERE event_type = 'LOGIN' AND event_time >= TODAY();
+
+# Taux d'erreur de connexion
+SELECT 
+    SUM(if(event_type = 'LOGIN_ERROR', 1, 0)) as errors,
+    SUM(if(event_type = 'LOGIN', 1, 0)) as successes,
+    100.0 * SUM(if(event_type = 'LOGIN_ERROR', 1, 0)) / COUNT(*) as error_rate_pct
+FROM login_events
+WHERE event_time >= TODAY();
+
+# Événements par application
+SELECT client_id, COUNT(*) as count
+FROM login_events
+WHERE event_time >= TODAY()
+GROUP BY client_id
+ORDER BY count DESC;
+
+# Pays de provenance des connexions
+SELECT geo_country, COUNT(*) as count
+FROM login_events
+WHERE event_time >= TODAY() AND event_type = 'LOGIN'
+GROUP BY geo_country
+ORDER BY count DESC
+LIMIT 20;
+
+
+3.2 REQUÊTES DE SÉCURITÉ
+────────────────────────
+
+# HIGH RISK events (MFA required)
+SELECT event_time, username, ip, geo_country, risk_score, risk_reasons
+FROM login_events
+WHERE risk_score >= 60 AND event_time >= NOW() - INTERVAL 24 HOUR
+ORDER BY risk_score DESC;
+
+# Tor exit nodes detected
+SELECT event_time, username, ip, risk_score
+FROM login_events
+WHERE is_tor = 1 AND event_time >= NOW() - INTERVAL 7 DAY
+ORDER BY event_time DESC;
+
+# Malicious IPs (abuse_score > 50)
+SELECT DISTINCT ip, abuse_score, abuse_isp, COUNT(*) as attempts
+FROM login_events
+WHERE abuse_score > 50 AND event_time >= NOW() - INTERVAL 24 HOUR
+GROUP BY ip
+ORDER BY COUNT(*) DESC;
+
+# Brute force attempts (>= 3 failures en 5 min)
+SELECT user_id, username, COUNT(*) as failure_count
+FROM login_events
+WHERE event_type = 'LOGIN_ERROR' AND fails_5m >= 3 
+  AND event_time >= NOW() - INTERVAL 24 HOUR
+GROUP BY user_id
+ORDER BY COUNT(*) DESC;
+
+# New devices detected
+SELECT user_id, username, device_fp, geo_country, event_time
+FROM login_events
+WHERE is_new_device = 1 AND event_time >= NOW() - INTERVAL 24 HOUR
+ORDER BY event_time DESC
+LIMIT 100;
+
+# Night logins for sensitive apps
+SELECT event_time, username, client_id, ip, geo_country, risk_score
+FROM login_events
+WHERE is_night_login = 1 AND app_sensitivity >= 4
+  AND event_time >= NOW() - INTERVAL 24 HOUR
+ORDER BY risk_score DESC;
+
+
+3.3 REQUÊTES D'ANALYSE UTILISATEUR
+───────────────────────────────────
+
+# Profile d'un utilisateur (7 derniers jours)
+SELECT 
+    username,
+    COUNT(*) as total_logins,
+    SUM(if(device_fp IS NOT NULL, 1, 0)) as active_devices,
+    MIN(geo_country) as countries,
+    AVG(risk_score) as avg_risk,
+    MAX(risk_score) as max_risk
+FROM login_events
+WHERE user_id = 'user-123' AND event_time >= NOW() - INTERVAL 7 DAY
+GROUP BY username;
+
+# Devices utilisateur
+SELECT DISTINCT device_fp, ua_browser, ua_os, ua_device, COUNT(*) as uses
+FROM login_events
+WHERE user_id = 'user-123' AND event_time >= NOW() - INTERVAL 30 DAY
+GROUP BY device_fp
+ORDER BY uses DESC;
+
+# Géolocalisation usuelle de l'utilisateur
+SELECT geo_country, geo_city, COUNT(*) as logins, AVG(risk_score) as avg_risk
+FROM login_events
+WHERE user_id = 'user-123' AND event_time >= NOW() - INTERVAL 90 DAY
+GROUP BY geo_country, geo_city
+ORDER BY logins DESC;
+
+# Pattern temporel
+SELECT hour, COUNT(*) as logins, AVG(risk_score) as avg_risk
+FROM login_events
+WHERE user_id = 'user-123' AND event_time >= NOW() - INTERVAL 30 DAY
+GROUP BY hour
+ORDER BY hour;
+
+
+3.4 REQUÊTES STATISTIQUES
+──────────────────────────
+
+# Statistiques de distribution du risk_score
+SELECT 
+    toInt8(risk_score / 10) * 10 as risk_bucket,
+    COUNT(*) as events,
+    100.0 * COUNT(*) / (SELECT COUNT(*) FROM login_events WHERE event_time >= NOW() - INTERVAL 7 DAY) as pct
+FROM login_events
+WHERE event_time >= NOW() - INTERVAL 7 DAY AND event_type = 'LOGIN'
+GROUP BY risk_bucket
+ORDER BY risk_bucket;
+
+# Distribution des appareils (navigateur/OS)
+SELECT ua_browser, ua_os, COUNT(*) as count
+FROM login_events
+WHERE event_time >= NOW() - INTERVAL 30 DAY
+GROUP BY ua_browser, ua_os
+ORDER BY count DESC
+LIMIT 20;
+
+# Top 10 utilisateurs les plus actifs
+SELECT user_id, username, COUNT(*) as logins, SUM(if(event_type = 'LOGIN_ERROR', 1, 0)) as errors
+FROM login_events
+WHERE event_time >= NOW() - INTERVAL 7 DAY
+GROUP BY user_id
+ORDER BY logins DESC
+LIMIT 10;
+
+# ISP distribution
+SELECT abuse_isp, COUNT(*) as connections, AVG(abuse_score) as avg_abuse
+FROM login_events
+WHERE event_time >= NOW() - INTERVAL 7 DAY
+GROUP BY abuse_isp
+ORDER BY COUNT(*) DESC
+LIMIT 20;
+
+
+3.5 REQUÊTES ALERTES & INCIDENTS
+─────────────────────────────────
+
+# Alerte: Changement géographique rapide
+SELECT t1.username, t1.geo_country as location1, t2.geo_country as location2, 
+       t1.event_time as time1, t2.event_time as time2
+FROM login_events t1
+JOIN login_events t2 
+    ON t1.user_id = t2.user_id 
+    AND t1.event_time < t2.event_time
+WHERE t1.geo_country != t2.geo_country
+    AND DATE_DIFF('minute', t1.event_time, t2.event_time) < 60
+    AND t1.event_time >= NOW() - INTERVAL 24 HOUR;
+
+# Alerte: Même utilisateur depuis IPs très différentes
+SELECT user_id, COUNT(DISTINCT ip) as unique_ips, COUNT(*) as logins
+FROM login_events
+WHERE event_time >= NOW() - INTERVAL 1 HOUR
+GROUP BY user_id
+HAVING COUNT(DISTINCT ip) >= 5;
+
+# Alerte: Accès depuis multiples pays en 24h
+SELECT user_id, username, COUNT(DISTINCT geo_country) as countries, COUNT(*) as logins
+FROM login_events
+WHERE event_time >= NOW() - INTERVAL 24 HOUR AND event_type = 'LOGIN'
+GROUP BY user_id
+HAVING COUNT(DISTINCT geo_country) > 3;
+
+
+================================================================================
+4. DASHBOARDS D'ANALYSE RECOMMANDÉS
+================================================================================
+
+4.1 DASHBOARD SÉCURITÉ (REAL-TIME)
+──────────────────────────────────
+
+Panel 1: High Risk Events (Gauge)
+  Métrique: COUNT(*) WHERE risk_score >= 60 AND event_time >= NOW() - INTERVAL 1 HOUR
+  Alerte: > 10 = orange, > 50 = rouge
+
+Panel 2: Top Threats (Table)
+  Requête: Tor exits, malicious IPs, brute force
+  Afficher: IP, abuse_score, count, locations
+
+Panel 3: Failed Login Trend (Graph)
+  Métrique: SUM(if(event_type = 'LOGIN_ERROR', 1, 0))
+  Ventilé par: hour (24h buckets)
+  Alerte: Spike > 2x moyenne = notification
+
+Panel 4: MFA Trigger Rate (KPI)
+  Métrique: 100 * SUM(step_up_required) / COUNT(*)
+  Target: < 10%
+
+Panel 5: Géolocalisation (World Map)
+  Métrique: COUNT(*) FROM login_events
+  Ventilé par: geo_country
+  Taille bulles: proportionnelle aux logins
+  Couleur: risk_score moyenne
+
+
+4.2 DASHBOARD UTILISATEUR
+─────────────────────────
+
+Panel 1: Activité (Timeline)
+  Afficher: Login succés/erreurs par jour
+
+Panel 2: Devices (Table)
+  Colonnes: Browser, OS, Last seen, Risk avg
+
+Panel 3: Géolocalisation Usuuelle (List)
+  Top 5 pays/villes
+
+Panel 4: Patterns Anormaux (Alerts)
+  - Night access
+  - Nouveau device
+  - Changement géographique rapide
+
+
+4.3 DASHBOARD COMPLIANCE/AUDIT
+───────────────────────────────
+
+Panel 1: Total Logins (Counter)
+Panel 2: Failed Attempts (Counter)
+Panel 3: Apps Accédées (Pie chart)
+Panel 4: Audit Trail (Searchable table)
+  Colonnes: Time, User, App, IP, Country, Status
+
+
+================================================================================
+5. OPTIMISATIONS ET INDEXATION
+================================================================================
+
+5.1 INDEX PRIMAIRES
+───────────────────
+
+ORDER BY (event_time, user_id, realm)
+  └─ Optimise les requêtes par temps/user/realm
+
+PARTITION BY toDate(event_time)
+  └─ Partition quotidienne pour TTL management
+
+
+5.2 COMPRESSION
+───────────────
+
+Codecs activées:
+  - LZ4 par défaut (fast)
+  - ZSTD pour colonnes texte (better ratio)
+
+Exemple: Column geo_country CODEC(ZSTD)
+
+
+5.3 MATERIALIZED VIEWS (Pour requêtes fréquentes)
+──────────────────────────────────────
+
+# View: High Risk Events
+CREATE MATERIALIZED VIEW high_risk_mv AS
+SELECT event_time, user_id, username, ip, risk_score, risk_reasons
+FROM login_events
+WHERE risk_score >= 60;
+
+# View: Daily Statistics
+CREATE MATERIALIZED VIEW daily_stats AS
+SELECT 
+    toDate(event_time) as date,
+    COUNT(*) as total_events,
+    SUM(if(event_type = 'LOGIN', 1, 0)) as logins,
+    SUM(step_up_required) as mfa_required,
+    AVG(risk_score) as avg_risk
+FROM login_events
+GROUP BY date;
+
+
+5.4 TTL (Time To Live)
+──────────────────────
+
+Stocker:
+  - 30 jours: Hot (rapide)
+  - 30-90 jours: Warm (compressé)
+  - 90+ jours: Archive (S3)
+
+Configuration:
+  ALTER TABLE login_events MODIFY TTL event_time + INTERVAL 90 DAY;
+
+
+================================================================================
+6. FEATURES FUTURES À AJOUTER
+================================================================================
+
+6.1 FEATURES DE CONTEXTE
+────────────────────────
+
+52. user_location_history (Array(String))
+    └─ Historique des 10 dernières localisations de l'user
+    └─ Utilité: Détecter impossible travel
+
+53. is_impossible_travel (UInt8)
+    └─ Calculé si deux logins depuis deux pays trop éloignés
+    └─ Formule: distance / (time_diff_hours * 900 km/h) > 1
+    └─ Risk scoring: +50 points si impossible travel
+
+54. distance_from_last_location_km (Float32)
+    └─ Distance en km depuis dernière localisation connue
+    └─ Utilité: Anomaly detection
+    └─ Risk scoring: +5 à +20 selon distance
+
+55. is_vpn_detected (UInt8)
+    └─ Détecté si IPQualityScore ou similaire
+    └─ Risk scoring: +15 points
+    └─ Whitelist: Certaines VPNs corp OK
+
+56. vpn_provider (String)
+    └─ Ex: "NordVPN", "ExpressVPN", "Corporate Cisco"
+    └─ Utilité: Audit
+
+57. is_proxy_detected (UInt8)
+    └─ Détecté si proxy/datacenter IP
+    └─ Différent de VPN
+    └─ Utilité: Bloquer automatisation bots
+
+58. proxy_provider (String)
+    └─ Ex: "Bright Data", "Luminati", "Squid Proxy"
+
+
+6.2 FEATURES DE COMPORTEMENT
+──────────────────────────────
+
+59. consecutive_failures (UInt32)
+    └─ Nombre d'échecs consécutifs avant succès
+    └─ Reset à 0 après LOGIN réussi
+    └─ Risk scoring: +5 per consecutive failure
+
+60. time_since_last_successful_login_mins (Int32)
+    └─ Nombre de minutes depuis dernier LOGIN réussi
+    └─ -1 si aucun LOGIN antérieur
+    └─ Utilité: Déterminer inactivité
+
+61. is_account_dormant (UInt8)
+    └─ 1 si pas de LOGIN depuis 30+ jours
+    └─ Risk scoring: +10 points
+    └─ Utilité: Flaguer comptes suspects réactivés
+
+62. login_frequency_deviation (Float32)
+    └─ σ (standard deviation) de fréquence de login
+    └─ -2σ = très infrequent, +2σ = très fréquent
+    └─ Détecte anomalies comportement utilisateur
+
+63. app_switching_count (UInt8)
+    └─ Nombre d'apps différentes accédées en 1h
+    └─ Risk scoring: +3 per extra app (max +20)
+    └─ Utilité: Détects accès lateral après compromise
+
+
+6.3 FEATURES DE DONNÉES SENSIBLES
+──────────────────────────────────
+
+64. data_classification_level (UInt8)
+    └─ 1-5, basé sur app sensibilité
+    └─ Utilisé pour PII scoring
+    └─ Risk scoring: app_sensitivity déjà fait ça
+
+65. pii_fields_accessed (Array(String))
+    └─ Si login → log qui a accédé quoi
+    └─ Ex: ["email", "ssn", "credit_card"]
+    └─ Utilité: RGPD audit trail
+
+66. data_exfiltration_suspected (UInt8)
+    └─ ML model detecting suspicious data access patterns
+    └─ Ex: large downloads, unusual times
+    └─ Risk scoring: +40 points
+
+
+6.4 FEATURES DE MACHINE LEARNING
+──────────────────────────────────
+
+67. ml_anomaly_score (Float32)
+    └─ Xgboost/LightGBM model score (0-1)
+    └─ Remplace partiellement risk_score heuristique
+    └─ Trained sur 90+ jours data historiques
+    └─ Updated weekly
+
+68. ml_feature_importance_json (String)
+    └─ Top 10 features qui ont décidé la prédiction ML
+    └─ Pour explainability (XAI)
+    └─ Utile pour investigations
+
+69. is_ml_high_confidence (UInt8)
+    └─ 1 si confidence > 95%, 0 sinon
+    └─ Permet to_trust ou ignore le score ML
+
+70. ml_model_version (String)
+    └─ Version du modèle utilisé (ex: "v2.3.1")
+    └─ Permet reproducibilité audit
+
+
+6.5 FEATURES D'AUTHENTIFICATION MULTIFACTEUR
+────────────────────────────────────────────
+
+71. mfa_method_used (String)
+    └─ Si login avec MFA: méthode utilisée
+    └─ Valeurs: "TOTP", "SMS", "EMAIL", "PUSH", "NONE"
+    └─ Utilité: Audit quel facteur accepté
+
+72. mfa_response_time_secs (Int32)
+    └─ Secondes entre challenge et réponse
+    └─ Si > 600 = timeout
+    └─ Risk scoring: +5 si mfa_response_time > 300 sec
+
+73. mfa_success (UInt8)
+    └─ Si MFA triggered: 0=failed, 1=success
+    └─ Utilité: Audit MFA efficacité
+
+74. mfa_attempts_before_success (UInt8)
+    └─ Nombre de tentatives avant bon code
+    └─ > 3 = risk scoring +10
+
+
+6.6 FEATURES DE SÉCURITÉ AVANCÉE
+─────────────────────────────────
+
+75. bot_score (Float32)
+    └─ Score détection bot (0-1)
+    └─ Source: datadome, imperva, etc.
+    └─ Risk scoring: +30 points si > 0.9
+
+76. is_credential_stuffing_attack (UInt8)
+    └─ Detecté si plusieurs user_id tentés depuis same IP
+    └─ Count > 10 en 10 min = attack
+
+77. is_account_takeover_suspected (UInt8)
+    └─ ML model + rules detection
+    └─ True si several anomalies together
+
+78. is_session_hijacking_suspected (UInt8)
+    └─ Detecté si device_fp change drastiquement
+    └─ Ou impossible travel dans le même session
+
+
+6.7 FEATURES D'ANALYSE PRÉDICTIVE
+──────────────────────────────────
+
+79. risk_trend (String)
+    └─ Valeurs: "STABLE", "INCREASING", "DECREASING"
+    └─ Basé sur moyenne rolling 7j vs actuel
+    └─ Utile pour alertes trend
+
+80. predicted_risk_next_login (Float32)
+    └─ Forecast ML: estimate prochaine login risk
+    └─ Based on user pattern, time-of-day, etc.
+
+
+6.8 FEATURES DE CONFORMITÉ
+──────────────────────────
+
+81. regulatory_classification (String)
+    └─ "PCI-DSS", "HIPAA", "GDPR", "PII", "NONE"
+    └─ Determine audit requirements
+
+82. breach_flag (UInt8)
+    └─ 1 si IP impliquée dans known breach
+    └─ Source: Have I Been Pwned IPs
+    └─ Utilité: Immediate block or alert
+
+83. access_from_restricted_country (UInt8)
+    └─ 1 si geo_country in blocklist
+    └─ Utile pour export controls
+
+
+6.9 FEATURES D'INTÉGRATION EXTERNE
+───────────────────────────────────
+
+84. siem_alert_id (String)
+    └─ ID d'alerte SIEM externe (si soumis)
+    └─ Permet cross-reference Splunk/ELK
+
+85. external_threat_feed_match (Array(String))
+    └─ IP matches known threat feeds
+    └─ Ex: ["malwaredomains.com", "abuse.ch"]
+
+86. darknet_market_mention (UInt8)
+    └─ 1 si IP spotted on darknet markets
+    └─ Source: paid threat feeds
+
+
+RÉSUMÉ DES 35 NOUVELLES FEATURES PROPOSÉES
+
+Catégorie                   | Nouvelles Colonnes | Utilité
+────────────────────────────┼────────────────────┼──────────────────
+Contexte Avancé             | 8                  | Impossible travel
+Comportement                | 6                  | Anomaly ML
+Données Sensibles           | 3                  | PII tracking
+Machine Learning            | 4                  | Predictive scoring
+MFA Advanced                | 4                  | MFA analytics
+Sécurité Avancée            | 4                  | ATO detection
+Prédictif                   | 2                  | Forecasting
+Conformité                  | 3                  | Regulatory
+Intégration                 | 3                  | Third-party feeds
+────────────────────────────┴────────────────────┴──────────────────
+
+NOUVEAU TOTAL: 51 + 35 = 86 colonnes potentielles
+
+
+================================================================================
+CONCLUSION
+================================================================================
+
+✓ Table login_events captures 50+ dimensions d'authentification
+✓ Enabled real-time threat intelligence & scoring
+✓ Supports compliance audit trails
+✓ 35 features futures pour ML & advanced analytics
+
+Le data warehouse ClickHouse fournit:
+  - Stockage compressé efficace (100:1 ratio)
+  - Queries ultra-rapides (< 1 sec pour 1M rows)
+  - TTL & partitioning automatique
+  - Integration facile avec BI tools (Grafana, Kibana)
+
+Les queries montrent des use cases réels:
+  - Security monitoring
+  - User behavior analytics
+  - Compliance reporting
+  - Incident response
+
+
+================================================================================
+[FIN DU GUIDE CLICKHOUSE FEATURES]
+================================================================================

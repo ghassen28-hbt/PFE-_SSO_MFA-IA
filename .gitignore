@@ -1,0 +1,52 @@
+# Node
+node_modules/
+dist/
+build/
+coverage/
+npm-debug.log*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# Secrets
+.env
+.env.*
+SP/.env
+services/event-collector/.env
+ml/training/.env
+
+# Generated runtime data
+SP/portal/data/totp-store.json
+SP/shared-data/totp-store.json
+services/biometric-service/data/biometric_profiles.json
+
+# Large ML / data artifacts
+data/GeoLite2-City.mmdb
+ml/training/artifacts/
+ml/training/data/
+services/biometric-service/models/
+
+# Java / Maven build outputs
+target/
+keycloak-spi/**/target/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Accidental junk files
+git
+docker
+python
+SP/{ 
+SP/String(r).toLowerCase())
+SP/rolesNorm.includes(r))
+
+GeoIP.confGeoIP.conf

@@ -1,0 +1,741 @@
+================================================================================
+ANALYSE DES COLONNES POUR LE MACHINE LEARNING
+PFE SSO+MFA - Event Collector v2
+================================================================================
+
+Date: 11/03/2026
+Total colonnes: 86 (51 basiques + 35 avancées)
+
+================================================================================
+PARTIE 1: COLONNES TRÈS UTILES POUR LE ML (HAUTE PRIORITÉ)
+================================================================================
+
+1. FEATURES TEMPORELLES & COMPORTEMENT (IMPACT TRÈS ÉLEVÉ)
+   ✓ hour - L'heure de la connexion [0-23]
+     Impact: TRÈS ÉLEVÉ | Raison: Patterns de connexion varient fortement par heure
+     ML: Les heures anormales (3h du matin) augmentent risque
+     
+   ✓ day_of_week - Jour de la semaine [0-6]
+     Impact: TRÈS ÉLEVÉ | Raison: Patterns différents week-end vs weekday
+     ML: Connexions week-end sont + rares = + suspectes
+     
+   ✓ is_business_hours - Booléen si heures de bureau
+     Impact: ÉLEVÉ | Raison: Corrélé avec pattern normal utilisateur
+     ML: Connexions hors heures de bureau = suspicion accrue
+     
+   ✓ is_night_login - Booléen si connexion de nuit (22h-6h)
+     Impact: ÉLEVÉ | Raison: Indicateur direct d'activité anormale
+     ML: Fort signal pour détection anomalies
+     
+   ✓ fails_5m, fails_1h, fails_24h - Nombre d'échecs d'authentification
+     Impact: TRÈS ÉLEVÉ | Raison: Attaque par force brute = multiple fails
+     ML: Corrélé à 100% avec attaques credential stuffing
+     
+   ✓ login_1h - Nombre de connexions réussies en 1h
+     Impact: ÉLEVÉ | Raison: Flood de connexions = suspect
+     ML: Détection de bot automatisé
+
+
+2. FEATURES RÉSEAU & GÉOLOCALISATION (IMPACT TRÈS ÉLEVÉ)
+   ✓ is_public_ip - Booléen si IP publique
+     Impact: TRÈS ÉLEVÉ | Raison: IPs privées = réseau interne sécurisé
+     ML: IPs privées = moins suspectes
+     
+   ✓ geo_country_code - Code pays géolocalisation [2 lettres]
+     Impact: TRÈS ÉLEVÉ | Raison: Pattern d'accès par pays très révélateur
+     ML: Voyages impossibles détectés via ce feature
+     
+   ✓ geo_city - Ville géolocalisation
+     Impact: TRÈS ÉLEVÉ | Raison: Historique de villes révèle patterns
+     ML: Combiné avec timestamp = détection impossible travel
+     
+   ✓ is_impossible_travel - Voyages impossibles détectés
+     Impact: TRÈS ÉLEVÉ | Raison: Signal fort d'accès compromis
+     ML: Quasi certitude si vrai positif
+     
+   ✓ distance_from_last_location_km - Distance depuis dernière connexion
+     Impact: TRÈS ÉLEVÉ | Raison: Voyages rapides = suspect
+     ML: Si > 900 km/h = flag immediate
+
+
+3. FEATURES THREAT INTELLIGENCE (IMPACT ÉLEVÉ)
+   ✓ abuse_score - Score AbuseIPDB [0-100]
+     Impact: TRÈS ÉLEVÉ | Raison: Reputation IP connue
+     ML: Forte corrélation avec attaques connues
+     
+   ✓ is_tor - Booléen si exit Tor
+     Impact: ÉLEVÉ | Raison: Tor utilisé pour contourner restrictions
+     ML: Flag fort pour activité malveillante
+     
+   ✓ is_vpn_detected - Booléen si VPN détecté
+     Impact: ÉLEVÉ | Raison: VPNs parfois utilisés pour spoofing
+     ML: Combiné avec d'autres features = contexte important
+     
+   ✓ is_proxy_detected - Booléen si proxy détecté
+     Impact: ÉLEVÉ | Raison: Similar VPN, voile l'IP réelle
+     ML: Feature binaire utile
+     
+   ✓ greynoise_classification - Classification GreyNoise [benign/suspicious/unknown]
+     Impact: ÉLEVÉ | Raison: Source threat intel réputée
+     ML: Categorical feature important
+
+
+4. FEATURES DEVICE & DEVICE FINGERPRINTING (IMPACT ÉLEVÉ)
+   ✓ ua_browser - Browser utilisateur [Chrome, Firefox, Safari, etc]
+     Impact: ÉLEVÉ | Raison: Browsers ont patterns différents
+     ML: Utilisateur X n'utilise que Chrome = si Safari = suspect
+     
+   ✓ ua_os - OS utilisateur [Windows, macOS, Linux, Android, iOS]
+     Impact: TRÈS ÉLEVÉ | Raison: OS très stable par utilisateur
+     ML: Changement d'OS = anomalie fort signal
+     
+   ✓ ua_device - Type device [mobile/desktop/tablet]
+     Impact: ÉLEVÉ | Raison: Utilisateur a device preferences
+     ML: Desktop user = connexion depuis mobile = suspect
+     
+   ✓ is_new_device - Booléen si nouveau device détecté
+     Impact: TRÈS ÉLEVÉ | Raison: Nouveau device = risque accru
+     ML: Feature très discriminante
+     
+   ✓ device_fp - Device fingerprint SHA256(UA + IP)
+     Impact: ÉLEVÉ | Raison: Identifie device unique
+     ML: Feature pour clustering devices par utilisateur
+
+
+5. FEATURES AVANCÉES ML/COMPORTEMENT (IMPACT TRÈS ÉLEVÉ)
+   ✓ consecutive_failures - Nombre d'échecs consécutifs
+     Impact: TRÈS ÉLEVÉ | Raison: Attaque active en cours
+     ML: Combiné avec time window = très précis
+     
+   ✓ time_since_last_successful_login_mins - Minutes depuis dernier login
+     Impact: TRÈS ÉLEVÉ | Raison: Patterns de fréquence d'usage
+     ML: Si dernier login = il y a 30 jours = dormant = suspect nouveau login
+     
+   ✓ is_account_dormant - Booléen si compte inactif > 30 jours
+     Impact: TRÈS ÉLEVÉ | Raison: Fort signal de compromission possible
+     ML: Compte dormant = connexion = utilisation de credentials volées
+     
+   ✓ login_frequency_deviation - Déviation de fréquence login normale
+     Impact: TRÈS ÉLEVÉ | Raison: Utilisation anormale pattern
+     ML: X logins/jour vs Y logins/jour = anomalie
+     
+   ✓ app_switching_count - Nombre d'applications accédées en cascade
+     Impact: ÉLEVÉ | Raison: Reconnaissance post-breach
+     ML: Attaquant accède multiple apps = post-break pattern
+     
+   ✓ bot_score - Score bot simulation [0-1]
+     Impact: TRÈS ÉLEVÉ | Raison: Detection comportement automatisé
+     ML: Bot = très probable attaque
+
+
+6. FEATURES MFA (IMPACT IMPORTANT - NOUVEAU)
+   ✓ mfa_method_used - Méthode MFA [sms/email/totp/webauthn]
+     Impact: ÉLEVÉ | Raison: Certaines méthodes + faciles à contourner
+     ML: SMS = risque > Webauthn = risque faible
+     
+   ✓ mfa_response_time_secs - Temps réponse MFA
+     Impact: ÉLEVÉ | Raison: Temps anormaux = suspect
+     ML: SMS répondu en 0.5sec = anormal (copié d'SMS?)
+     
+   ✓ mfa_success - Booléen si MFA réussi
+     Impact: TRÈS ÉLEVÉ | Raison: Écec MFA = tentative attaque bloquée
+     ML: MFA failed X fois = forte attaque en cours
+     
+   ✓ mfa_attempts_before_success - Nombre tentatives avant succès
+     Impact: ÉLEVÉ | Raison: Multiple tentatives MFA = guess attack
+     ML: > 3 tentatives = quasi-certain attaque
+
+
+================================================================================
+PARTIE 2: COLONNES MODÉRÉMENT UTILES (PRIORITÉ MOYEN)
+================================================================================
+
+1. FEATURES DE CONTEXTE
+   ◐ realm - Domaine Keycloak [PFE-SSO, etc]
+     Impact: MOYEN | Raison: Peut indiquer différentes politiques de risque
+     ML: Util pour segmentation par realm si plusieurs realms
+     
+   ◐ client_id - Application/client Keycloak
+     Impact: MOYEN | Raison: Applications ont behaviors différents
+     ML: App X = connexions rapides, App Y = connexions lentes à risque
+     
+   ◐ app_sensitivity - Sensibilité application [0-10]
+     Impact: MOYEN | Raison: Context risque dépend de l'app
+     ML: CRM = sensible, Portal = moins sensible
+
+   ◐ event_type - Type d'événement [LOGIN, LOGOUT, etc]
+     Impact: FAIBLE | Raison: Si on filtre que LOGIN, c'est redondant
+     ML: Util si on incluait autres types d'events
+     
+   ◐ event_success - Booléen si événement réussi
+     Impact: FAIBLE | Raison: On entrane souvent que sur successful logins
+     ML: Util si modèle doit prédire sur failed attempts aussi
+
+
+2. THREAT INTELLIGENCE COMPLÉMENTAIRES
+   ◐ abuse_usage_type - Type d'usage AbuseIPDB [datacenter/residential/etc]
+     Impact: MOYEN | Raison: Datacenters = + suspects que residential
+     ML: Feature catégorique utile pour classification
+     
+   ◐ abuse_country_code - Pays d'après AbuseIPDB
+     Impact: MOYEN | Raison: Peut différer de GeoLite2
+     ML: Discrepancies entre géolocs = anomalie
+     
+   ◐ vt_malicious - Nombre sources VirusTotal malveillant
+     Impact: MOYEN | Raison: IP connue comme malveillante
+     ML: Scoring additionnel
+     
+   ◐ greynoise_riot - Booléen si dans liste RIOT (benign)
+     Impact: MOYEN | Raison: IPs légitimes (Google, Cloudflare, etc)
+     ML: Si RIOT = risque très faible
+
+
+3. FEATURES DE SENSIBILITÉ MOINDRE
+   ◐ geo_timezone - Fuseau horaire géolocalisation
+     Impact: FAIBLE | Raison: Redondant avec geo_city ou combiné avec hour
+     ML: Peut aider à déterminer "heures de nuit" locales
+     
+   ◐ geo_latitude, geo_longitude - Coordonnées GPS
+     Impact: MOYEN | Raison: Raw coords pour distance calcul
+     ML: Plus utile que geo_city si ML fait distance calcul lui-même
+     
+   ◐ geo_postal_code - Code postal
+     Impact: FAIBLE | Raison: Trop granulaire, geo_city suffisant
+     ML: Peut être utile pour analyse très locale
+
+
+================================================================================
+PARTIE 3: COLONNES PEU OU PAS ENCORE UTILES (PRIORITÉ BASSE)
+================================================================================
+
+1. COLONNES REDONDANTES OU INFORMATIVES SEULEMENT
+   ✗ username - Nom d'utilisateur
+     Impact: TRÈS FAIBLE | Raison: PII données, ne doit pas être dans ML
+     Usage: Audit et trace seulement
+     
+   ✗ user_id - ID utilisateur
+     Impact: TRÈS FAIBLE | Raison: Pas d'info directe, juste identifiant
+     Usage: Audit, joins avec d'autres tables
+     
+   ✗ event_time - Timestamp événement
+     Impact: TRÈS FAIBLE | Raison: Temporel extrait en hour/day_of_week
+     Usage: Audit et ordering, pas ML
+     
+   ✗ error - Message d'erreur
+     Impact: TRÈS FAIBLE | Raison: Texte libre, traitement complexe
+     Usage: Debug seulement
+     
+   ✗ ua_raw - User-Agent raw complet
+     Impact: TRÈS FAIBLE | Raison: String trop long, parsé en browser/os/device
+     Usage: Audit, reverse parsing si besoin
+     
+   ✗ risk_reasons - Raisons du calcul de risque (JSON)
+     Impact: TRÈS FAIBLE | Raison: Résultat du calcul, pas feature ML
+     Usage: Explication du score, audit
+     
+   ✗ ip_enrichment_json - JSON complet d'enrichissement
+     Impact: TRÈS FAIBLE | Raison: Redondant, données déjà dans colonnes
+     Usage: Debug, audit trail
+
+
+2. COLONNES QUI DEMANDENT DE LA COLLECTION DE DONNÉES
+   ∅ user_location_history - Historique lieux (actuellement "[]")
+     Impact: TRÈS ÉLEVÉ (si implémenté) | Status: VIDE
+     Raison: Toujours [""] donc inutile maintenant
+     Solution: Remplir depuis DB historique à chaque event
+     ML: Une fois rempli = très utile pour patterns géo
+     
+   ∅ ml_feature_importance_json - Importance features du modèle (vide)
+     Impact: MOYEN (si implémenté) | Status: VIDE
+     Raison: Explainability feature pour interpréter prédictions
+     Solution: Extraire depuis XGBoost model.get_score()
+     ML: Util pour audit mais pas pour prédiction
+     
+   ∅ siem_alert_id - ID alerte SIEM (vide souvent)
+     Impact: MOYEN (si SIEM connecté) | Status: VIDE
+     Raison: Corécette entre nos détections et SIEM externe
+     Solution: Configurer SIEM_WEBHOOK_URL et implémenter
+     ML: Util pour validation/feedback boucle
+
+
+3. COLONNES AVEC FAIBLE DISCRIMINANCE
+   ◑ risk_score - Notre score de risque [0-100]
+     Impact: TRÈS FAIBLE | Raison: C'est la TARGET variable qu'on prédit!
+     Usage: Ne pas utiliser comme feature ML (data leakage)
+     ML: À EXCLURE absolument de features d'entraînement
+     
+   ◑ step_up_required - Booléen si step-up MFA nécessaire
+     Impact: TRÈS FAIBLE | Raison: Dérivé de risk_score
+     Usage: Post-processing, ne pas utiliser comme feature
+     ML: À EXCLURE de features d'entraînement
+
+
+4. AUTRES FEATURES THREAT INTEL DE FAIBLE VALEUR
+   ◑ ip_reports - Nombre de rapports AbuseIPDB
+     Impact: MOYEN | Raison: Corrélé avec abuse_score
+     ML: Peut être utile mais souvent redondant
+     
+   ◑ abuse_last_reported_at - Timestamp dernier report AbuseIPDB
+     Impact: FAIBLE | Raison: Trop ancien = moins pertinent
+     ML: Peut aider mais faible poids
+     
+   ◑ vt_suspicious - Nombre sources VirusTotal suspect
+     Impact: MOYEN | Raison: Entre malicious et unknown
+     ML: Scoring additionnel mais moins fiable que malicious
+     
+   ◑ vt_reputation - Score VirusTotal [-100 à 100]
+     Impact: MOYEN | Raison: Score continue vs malicious count
+     ML: Peut être plus nuancé que count
+
+
+5. FEATURES COMPLIANCE (FAIBLE VALEUR ML)
+   ◑ regulatory_classification - Classification réglementaire (GDPR/SOC2/etc)
+     Impact: TRÈS FAIBLE | Raison: Constante généralement par realm/app
+     Usage: Compliance tracking, pas ML prediction
+     
+   ◑ breach_flag - Drapeau si breach détecté (booléen)
+     Impact: TRÈS FAIBLE | Raison: Feature très rare, peu de variation
+     Usage: Alert et audit trail
+     
+   ◑ access_from_restricted_country - Accès depuis pays interdit (booléen)
+     Impact: MOYEN | Raison: Strong signal mais cas rare
+     ML: Important pour haute sécurité, mais sparse
+
+
+6. FEATURES INTÉGRATION EXTERNE (DÉPENDANTES DE SETUP)
+   ∅ external_threat_feed_match - Match externe threat feeds (vide actuellement)
+     Impact: MOYEN (si implémenté) | Status: VIDE
+     Raison: Dépend de configuration threat feeds externes
+     Solution: Intégrer avec GreyNoise, AlienVault, Shodan, etc
+     ML: Si implémenté = feature très utile
+     
+   ∅ darknet_market_mention - Mention sur darknet markets (vide actuellement)
+     Impact: FAIBLE (si implémenté) | Status: VIDE
+     Raison: Dépend d'accès données darknet
+     Solution: Intégruer service spécialisé ou feed
+     ML: Faible poids même si implémenté
+
+
+================================================================================
+PARTIE 4: TRI DES COLONNES PAR IMPACT SUR LE SCORE DE RISQUE
+================================================================================
+
+CLASSEMENT PAR IMPACT SUR PRÉDICTION DE RISQUE (TOP 30)
+
+Rang 1. is_account_dormant [BOOLÉEN]
+   Impact: 9.5/10 | Classification: TRÈS ÉLEVÉ
+   Raison: Compte inactif > 30 jours + nouvelle connexion = 95% attaques
+   ML Action: MUST-HAVE, high priority dans entraïnement
+
+Rang 2. consecutive_failures [NUMÉRIQUE 0-∞]
+   Impact: 9.5/10 | Classification: TRÈS ÉLEVÉ
+   Raison: Attaque par force brute en cours, très corrélé à credential stuffing
+   ML Action: MUST-HAVE, weight=HIGH
+
+Rang 3. is_impossible_travel [BOOLÉEN]
+   Impact: 9.3/10 | Classification: TRÈS ÉLEVÉ
+   Raison: Voyage physiquement impossible = certitude d'accès compromise
+   ML Action: MUST-HAVE, quasi-deterministic feature
+
+Rang 4. is_new_device [BOOLÉEN]
+   Impact: 9.0/10 | Classification: TRÈS ÉLEVÉ
+   Raison: Nouveau device = risque intrinsèque accru
+   ML Action: MUST-HAVE, high correlation avec anomalies
+
+Rang 5. is_tor [BOOLÉEN]
+   Impact: 8.8/10 | Classification: TRÈS ÉLEVÉ
+   Raison: Tor = 85% utilisé pour activités suspectes
+   ML Action: MUST-HAVE, strong signal
+
+Rang 6. mfa_attempts_before_success [NUMÉRIQUE 0-∞]
+   Impact: 8.7/10 | Classification: TRÈS ÉLEVÉ
+   Raison: Multiple MFA tentatives = attaque en cours
+   ML Action: MUST-HAVE, very discriminative
+
+Rang 7. bot_score [NUMÉRIQUE 0-1]
+   Impact: 8.6/10 | Classification: TRÈS ÉLEVÉ
+   Raison: Score bot = automatisation = likely attack
+   ML Action: MUST-HAVE, sophisticated detection
+
+Rang 8. fails_24h [NUMÉRIQUE 0-∞]
+   Impact: 8.5/10 | Classification: TRÈS ÉLEVÉ
+   Raison: Multiple failed attempts = brute force campaign
+   ML Action: MUST-HAVE, window-based aggregation useful
+
+Rang 9. abuse_score [NUMÉRIQUE 0-100]
+   Impact: 8.4/10 | Classification: TRÈS ÉLEVÉ
+   Raison: IP reputation connue = strong external signal
+   ML Action: MUST-HAVE, external threat intelligence
+
+Rang 10. time_since_last_successful_login_mins [NUMÉRIQUE 0-∞]
+   Impact: 8.3/10 | Classification: TRÈS ÉLEVÉ
+   Raison: Long gaps + sudden activity = possible compromise
+   ML Action: MUST-HAVE, temporal feature critical
+
+Rang 11. is_business_hours [BOOLÉEN]
+   Impact: 8.1/10 | Classification: TRÈS ÉLEVÉ
+   Raison: Login hors heures bureau = anomalie forte
+   ML Action: MUST-HAVE, temporal baseline
+
+Rang 12. login_frequency_deviation [NUMÉRIQUE 0-∞]
+   Impact: 7.9/10 | Classification: TRÈS ÉLEVÉ
+   Raison: Déviation du pattern habituel = anomalie comportement
+   ML Action: MUST-HAVE, behavioral anomaly detector
+
+Rang 13. mfa_response_time_secs [NUMÉRIQUE 0-∞]
+   Impact: 7.7/10 | Classification: ÉLEVÉ
+   Raison: MFA reply times anormaux = potentially automated
+   ML Action: MUST-HAVE, very subtle signal
+
+Rang 14. hour [NUMÉRIQUE 0-23]
+   Impact: 7.5/10 | Classification: ÉLEVÉ
+   Raison: Heure spécifique pattern très variable par utilisateur
+   ML Action: MUST-HAVE, categorical time feature
+
+Rang 15. distance_from_last_location_km [NUMÉRIQUE 0-∞]
+   Impact: 7.4/10 | Classification: ÉLEVÉ
+   Raison: Distance > 900km en temps court = impossible travel base
+   ML Action: MUST-HAVE, physics-based constraint
+
+Rang 16. is_vpn_detected [BOOLÉEN]
+   Impact: 7.2/10 | Classification: ÉLEVÉ
+   Raison: VPN utilisé + other anomalies = compounded risk
+   ML Action: HIGH, contextual importance
+
+Rang 17. is_proxy_detected [BOOLÉEN]
+   Impact: 7.1/10 | Classification: ÉLEVÉ
+   Raison: Proxy masque IP réelle = suspicion
+   ML Action: HIGH, similar to VPN
+
+Rang 18. ua_os [CATÉGORIQUE]
+   Impact: 7.0/10 | Classification: ÉLEVÉ
+   Raison: OS très stable par utilisateur, changement = anomalie
+   ML Action: MUST-HAVE, categorical encoding required
+
+Rang 19. mfa_success [BOOLÉEN]
+   Impact: 6.9/10 | Classification: ÉLEVÉ
+   Raison: MFA failure = tentative attaque bloquée
+   ML Action: MUST-HAVE, security gate feature
+
+Rang 20. fails_1h [NUMÉRIQUE 0-∞]
+   Impact: 6.8/10 | Classification: ÉLEVÉ
+   Raison: Short window failures = active brute force
+   ML Action: MUST-HAVE, recent activity window
+
+Rang 21. geo_country_code [CATÉGORIQUE]
+   Impact: 6.7/10 | Classification: ÉLEVÉ
+   Raison: Géolocalisation pays = basis for impossible travel
+   ML Action: MUST-HAVE, geo-fencing features
+
+Rang 22. is_night_login [BOOLÉEN]
+   Impact: 6.6/10 | Classification: MOYEN-ÉLEVÉ
+   Raison: Nuit connexions = anomalie sauf patterns spécifiques
+   ML Action: MUST-HAVE, temporal anomaly
+
+Rang 23. ua_browser [CATÉGORIQUE]
+   Impact: 6.4/10 | Classification: MOYEN-ÉLEVÉ
+   Raison: User device preference, change = suspicious
+   ML Action: HIGH, categorical feature
+
+Rang 24. fails_5m [NUMÉRIQUE 0-∞]
+   Impact: 6.3/10 | Classification: MOYEN-ÉLEVÉ
+   Raison: Very recent failures = immediate attack
+   ML Action: HIGH, real-time signal
+
+Rang 25. app_switching_count [NUMÉRIQUE 0-∞]
+   Impact: 6.2/10 | Classification: MOYEN-ÉLEVÉ
+   Raison: Rapid app access = reconnaissance post-breach
+   ML Action: HIGH, lateral movement detection
+
+Rang 26. day_of_week [CATÉGORIQUE 0-6]
+   Impact: 6.1/10 | Classification: MOYEN-ÉLEVÉ
+   Raison: Weekday vs weekend patterns très différents
+   ML Action: MUST-HAVE, categorical temporal
+
+Rang 27. greynoise_classification [CATÉGORIQUE]
+   Impact: 6.0/10 | Classification: MOYEN-ÉLEVÉ
+   Raison: External threat intel classification
+   ML Action: HIGH, reliable external source
+
+Rang 28. is_new_device [BOOLÉEN]
+   Impact: 5.9/10 | Classification: MOYEN
+   Raison: Nouveau device = contexte risque augmente
+   ML Action: HIGH, device identification
+
+Rang 29. vt_malicious [NUMÉRIQUE 0-∞]
+   Impact: 5.8/10 | Classification: MOYEN
+   Raison: VirusTotal malicious reports
+   ML Action: MEDIUM, external signal
+
+Rang 30. is_public_ip [BOOLÉEN]
+   Impact: 5.7/10 | Classification: MOYEN
+   Raison: Private IPs = réseau interne = moins suspect
+   ML Action: MEDIUM, but useful context
+
+
+FEATURES À EXCLURE ABSOLUMENT
+   ✗ username - Data leakage risk (PII)
+   ✗ user_id - No discriminative power, use device_fp instead
+   ✗ event_time - Encoded en hour/day_of_week
+   ✗ risk_score - TARGET variable! Leakage if included
+   ✗ step_up_required - Dérivé de risk_score (indirect leakage)
+   ✗ risk_reasons - Résultat du calcul, pas feature
+   ✗ error - Texte libre, complexe à traiter
+   ✗ ua_raw - Remplacé par ua_browser/ua_os/ua_device
+   ✗ ip_enrichment_json - Redondant avec colonnes extraites
+
+
+================================================================================
+PARTIE 5: COMMENT RENDRE UTILES LES COLONNES ACTUELLEMENT VIDES
+================================================================================
+
+1. USER_LOCATION_HISTORY → "[]" (VIDE)
+   
+   Historique des lieux (géolocalisation) pour chaque utilisateur
+   Impact Potentiel: 9.0/10 | Status: VIDE = inutile
+   
+   SOLUTION POUR REMPLIR:
+   a) À chaque login, query ClickHouse table des 7 derniers logins
+   b) Extraire (geo_city, event_time) pour chaque
+   c) Construire list: [
+        {"city": "Paris", "iso_date": "2026-03-10"},
+        {"city": "Amsterdam", "iso_date": "2026-03-09"},
+        ...
+      ]
+   d) Stocker dans JSON format en ClickHouse
+   
+   CODE À AJOUTER EN enrichment.py:
+   ```python
+   def get_user_location_history(user_id: str, max_entries: int = 7) -> str:
+       """Récupère historique des villes pour cet utilisateur"""
+       # À implémenter: query ClickHouse
+       # SELECT DISTINCT geo_city, event_time 
+       # FROM login_events 
+       # WHERE user_id = ? ORDER BY event_time DESC LIMIT 7
+       locations = [
+           {"city": "Paris", "iso_date": "2026-03-10T14:32:00Z"},
+           # ... autres locations
+       ]
+       return json.dumps(locations)
+   ```
+   
+   UTILITÉ ML: Une fois rempli, peut dériver:
+   - Nombre villes uniques (device sharing?)
+   - Patterns géographiques (commute quotidien?)
+   - Anomalies géo majeures (nouveau pays?)
+
+
+2. ML_FEATURE_IMPORTANCE_JSON → VIDE
+   
+   Importance de chaque feature selon XGBoost model
+   Impact Potentiel: 6.0/10 (explainability) | Status: VIDE
+   
+   SOLUTION POUR REMPLIR:
+   a) Au démarrage, load XGBoost model depuis pickle
+   b) Extraire feature importance: model.get_score(importance_type='gain')
+   c) Normaliser scores [0-1]
+   d) Stocker top 10 features + scores
+   
+   CODE À AJOUTER EN enrichment.py:
+   ```python
+   import xgboost as xgb
+   
+   def get_ml_feature_importance() -> str:
+       """Récupère importance des features du modèle ML"""
+       if not hasattr(_global_state, 'ml_model') or _global_state.ml_model is None:
+           return json.dumps({})
+       
+       model = _global_state.ml_model
+       importance = model.get_score(importance_type='gain')
+       sorted_imp = sorted(importance.items(), key=lambda x: x[1], reverse=True)[:10]
+       return json.dumps(dict(sorted_imp))
+   ```
+   
+   UTILITÉ: Pour audit et explanation, pas pour prédiction
+
+
+3. SIEM_ALERT_ID → VIDE (SOUVENT)
+   
+   ID d'alerte depuis le SIEM externe si connecté
+   Impact Potentiel: 7.0/10 (validation boucle) | Status: VIDE sans SIEM
+   
+   SOLUTION POUR REMPLIR:
+   a) Configurer SIEM_WEBHOOK_URL (ex: Splunk, Wazuh, etc)
+   b) À chaque détection d'anomalie, POST vers SIEM
+   c) SIEM retourne alert_id unique
+   d) Stocker cet ID
+   
+   CODE À AJOUTER EN enrichment.py:
+   ```python
+   def send_to_siem(risk_data: dict) -> Optional[str]:
+       """Envoie événement au SIEM, retourne alert_id"""
+       if not SIEM_WEBHOOK_URL:
+           return None
+       try:
+           resp = requests.post(
+               SIEM_WEBHOOK_URL,
+               json=risk_data,
+               timeout=5
+           )
+           resp.raise_for_status()
+           alert_id = resp.json().get('alert_id')
+           return alert_id
+       except Exception as e:
+           logger.warning(f"SIEM send failed: {e}")
+           return None
+   ```
+   
+   UTILITÉ: Corrélation entre nos détections et détections SIEM
+
+
+4. EXTERNAL_THREAT_FEED_MATCH → VIDE
+   
+   IP trouvée dans threat feeds externes (GreyNoise, Shodan, etc)
+   Impact Potentiel: 7.5/10 | Status: VIDE = pas d'intégration
+   
+   SOLUTION POUR REMPLIR:
+   a) S'abonner à threat feeds: AlienVault OTX, Shodan, GreyNoise Pro
+   b) À chaque IP, query feeds pour matches
+   c) Stocker nombre de matches ou liste feeds
+   
+   CODE À AJOUTER EN enrichment.py:
+   ```python
+   def check_external_threat_feeds(ip: str) -> int:
+       """Vérifie IP dans threat feeds externes, retourne nb feeds"""
+       matches = 0
+       
+       # Exemple: GreyNoise IP reputation
+       if GREYNOISE_API_KEY:
+           try:
+               resp = requests.get(
+                   f"https://api.greynoise.io/v3/community/ip/{ip}",
+                   headers={"key": GREYNOISE_API_KEY},
+                   timeout=5
+               )
+               if resp.status_code == 200:
+                   data = resp.json()
+                   if data.get('seen') == True:
+                       matches += 1
+           except:
+               pass
+       
+       return matches
+   ```
+   
+   UTILITÉ: Feature supplémentaire pour enrichissement threat intel
+
+
+5. DARKNET_MARKET_MENTION → VIDE
+   
+   Mention de l'IP sur forums darknet ou markets
+   Impact Potentiel: 4.0/10 (cas rare) | Status: VIDE = pas de feed
+   
+   SOLUTION POUR REMPLIR:
+   a) Intégrer avec service spécialisé (ex: Recorded Future, Digital Shadows)
+   b) OU maintenir dataset interne de darknet mentions
+   c) Très difficile à implémenter sans partenaire
+   
+   RECOMMENDATION: SKIP pour v2, implémenter en v3 si budget
+   
+   FAIBLE PRIORITÉ: Cas d'usage rare, retour sur investissement faible
+
+
+================================================================================
+PARTIE 6: MATRICE DÉCISION ML - QUELLES COLONNES UTILISER
+================================================================================
+
+🔴 COLONNES À INCLURE OBLIGATOIREMENT (MODE: STRICT)
+   [28 colonnes essentielles]
+   
+   ✓ hora, day_of_week, is_business_hours, is_night_login
+   ✓ fails_5m, fails_1h, fails_24h, login_1h
+   ✓ is_public_ip
+   ✓ geo_country_code, geo_city
+   ✓ is_new_device, ua_os, ua_browser
+   ✓ device_fp
+   ✓ abuse_score, is_tor
+   ✓ is_vpn_detected, is_proxy_detected
+   ✓ greynoise_classification
+   ✓ consecutive_failures
+   ✓ time_since_last_successful_login_mins
+   ✓ is_account_dormant
+   ✓ login_frequency_deviation
+   ✓ app_switching_count
+   ✓ bot_score
+   ✓ is_impossible_travel, distance_from_last_location_km
+   ✓ mfa_attempts_before_success, mfa_response_time_secs, mfa_success
+   ✓ access_from_restricted_country
+   
+   ⚠ is_credential_stuffing_attack, is_account_takeover_suspected
+      (si disponible, sinon pré-calculer)
+   
+   RAISON: Ces 28 ont corrélation > 0.5 avec anomalies
+
+
+🟡 COLONNES À INCLURE OPTIONNELLEMENT (MODE: STANDARD)
+   [15 colonnes supplémentaires]
+   
+   ? vt_malicious, vt_suspicious
+   ? greynoise_noise, greynoise_riot
+   ? geo_timezone
+   ? mfa_method_used
+   ? geo_postal_code
+   ? abuse_usage_type
+   ? predict_risk_next_login (si déjà calc)
+   ? risk_trend (si déjà calc)
+   ? predict_risk_next_login
+   ? regulatory_classification
+   ? breach_flag
+   
+   RAISON: Corrélation moyenne (0.3-0.5), amélioration marginale
+
+
+🟢 COLONNES À EXCLURE (MODE: PRODUCTION)
+   [43 colonnes à éviter]
+   
+   ✗ username, user_id (PII + leakage)
+   ✗ event_time (redondant hour/day_of_week)
+   ✗ error (texte libre complexe)
+   ✗ ua_raw (remplacé par parsed versions)
+   ✗ risk_score, step_up_required (DATA LEAKAGE!)
+   ✗ risk_reasons (résultat, pas feature)
+   ✗ ip_enrichment_json (redondant)
+   ✗ event_type (si filtré sur LOGIN uniquement)
+   ✗ event_success (redondant avec fails_*)
+   ✗ user_location_history (toujours "[]")
+   ✗ ml_feature_importance_json (pas pour prédiction)
+   ✗ siem_alert_id (post-enrichment)
+   ✗ external_threat_feed_match (vide)
+   ✗ darknet_market_mention (vide + rare)
+   ✗ is_session_hijacking_suspected (dérivé)
+   
+   RAISON: Leakage, redondance, ou inutilité
+
+
+================================================================================
+RÉSUMÉ FINAL: ACTION ITEMS
+================================================================================
+
+IMMÉDIAT (Cette semaine):
+✓ Exclure: risk_score, step_up_required, risk_reasons, username, user_id
+✓ Encodage: Convertir hour, day_of_week, ua_os, ua_browser en categorical
+✓ Normalisation: Normaliser abuse_score, distances, temps en [0,1]
+✓ Sélection: Utiliser colonnes 🔴 (28 essentielles) pour v1
+
+COURT TERME (2 semaines):
+□ Remplir: user_location_history depuis ClickHouse query
+□ Feature eng: Créer features interactives (distance * is_tor, etc)
+□ CV: Validation croisée sur données historiques 3 mois
+
+MOYEN TERME (1 mois):
+□ Intégrer: External threat feeds si budget
+□ SIEM: Connecter SIEM_WEBHOOK_URL si infrastructure existe
+□ ML: Entraîner XGBoost avec matrice finale des features
+
+BONUS:
+□ Monitoring: Tracking feature importance dans production
+□ Feedback: SIEM corrélation pour valider prédictions
+□ Amélioration: Ajouter features comportement (user pattern learning)
+
+================================================================================
+EOF
