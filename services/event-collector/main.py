@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from datetime import datetime, timezone, timedelta
 import hashlib
 import json
@@ -7,6 +7,7 @@ import re
 import math
 import requests
 import ipaddress
+from typing import Optional, Dict, Any
 
 from user_agents import parse as parse_ua
 
@@ -42,17 +43,19 @@ SCORING_ENABLED = os.getenv("SCORING_ENABLED", "true").lower() == "true"
 SCORING_URL = os.getenv("SCORING_URL", "http://host.docker.internal:8090/score")
 SCORING_TIMEOUT = int(os.getenv("SCORING_TIMEOUT", "5"))
 
+_http = requests.Session()
+
 
 # ============================================================
 # OUTILS CLICKHOUSE
 # ============================================================
 
-def ch_query(sql: str):
-    r = requests.post(
+def ch_query(sql: str) -> str:
+    r = _http.post(
         f"{CLICKHOUSE_URL}/?database={CLICKHOUSE_DB}",
         data=sql.encode("utf-8"),
         auth=(CLICKHOUSE_USER, CLICKHOUSE_PASSWORD),
-        timeout=15,
+        timeout=20,
     )
     r.raise_for_status()
     return r.text
@@ -68,19 +71,37 @@ def sql_escape(value: str) -> str:
 # OUTILS GÉNÉRAUX
 # ============================================================
 
-def now_utc():
+def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
+
 def parse_event_time(data: dict) -> datetime:
-    raw_ts = (data.get("ts") or "").strip()
-    if raw_ts:
+    candidates = [
+        data.get("ts"),
+        data.get("event_time"),
+        data.get("timestamp"),
+        data.get("time"),
+    ]
+
+    for raw in candidates:
+        if raw is None:
+            continue
+
+        raw_str = str(raw).strip()
+        if not raw_str:
+            continue
+
         try:
-            # support "2026-03-31T13:56:16Z"
-            return datetime.fromisoformat(raw_ts.replace("Z", "+00:00")).astimezone(timezone.utc)
+            if raw_str.isdigit() and len(raw_str) >= 13:
+                return datetime.fromtimestamp(int(raw_str) / 1000, tz=timezone.utc)
+            if raw_str.isdigit() and len(raw_str) >= 10:
+                return datetime.fromtimestamp(int(raw_str), tz=timezone.utc)
+            return datetime.fromisoformat(raw_str.replace("Z", "+00:00")).astimezone(timezone.utc)
         except Exception:
-            pass
+            continue
 
     return now_utc()
+
 
 def time_features(dt: datetime):
     hour = dt.hour
@@ -89,27 +110,52 @@ def time_features(dt: datetime):
     return hour, dow, weekend
 
 
-def extract_real_ip(data: dict, request: Request) -> str:
-    details = data.get("details") or {}
-
-    candidates = [
-        data.get("ipAddress", ""),          # IP finale calculée par le SPI
-        data.get("event_ip", ""),           # IP native Keycloak
-        data.get("http_x_real_ip", ""),     # header réel si présent
-        request.headers.get("x-forwarded-for", ""),
-        data.get("http_x_forwarded_for", ""),
-        details.get("client_ip", ""),
-        request.client.host if request.client else "",
-    ]
+def _pick_first_valid_ip(candidates, prefer_public: bool = True) -> str:
+    public_ips = []
+    other_ips = []
 
     for value in candidates:
         if not value:
             continue
-        ip = str(value).split(",")[0].strip()
-        if ip:
-            return ip
+        parts = [p.strip() for p in str(value).split(",") if p.strip()]
+        for ip in parts:
+            try:
+                ipaddress.ip_address(ip)
+            except ValueError:
+                continue
+            if is_public_ip(ip):
+                public_ips.append(ip)
+            else:
+                other_ips.append(ip)
 
+    if prefer_public and public_ips:
+        return public_ips[0]
+    if other_ips:
+        return other_ips[0]
     return ""
+
+
+def extract_real_ip(data: dict, request: Request) -> str:
+    details = data.get("details") or {}
+
+    high_priority = [
+        request.headers.get("x-forwarded-for", ""),
+        request.headers.get("x-real-ip", ""),
+        data.get("http_x_forwarded_for", ""),
+        data.get("http_x_real_ip", ""),
+        details.get("client_ip", ""),
+        details.get("ipAddress", ""),
+    ]
+    ip = _pick_first_valid_ip(high_priority, prefer_public=True)
+    if ip:
+        return ip
+
+    low_priority = [
+        data.get("ipAddress", ""),
+        data.get("event_ip", ""),
+        request.client.host if request.client else "",
+    ]
+    return _pick_first_valid_ip(low_priority, prefer_public=False)
 
 
 def is_public_ip(ip: str) -> bool:
@@ -126,31 +172,11 @@ def is_public_ip(ip: str) -> bool:
 
 def extract_client_hints(data: dict, request: Request) -> dict:
     return {
-        "sec_ch_ua": (
-            data.get("http_sec_ch_ua")
-            or request.headers.get("sec-ch-ua", "")
-            or ""
-        ),
-        "sec_ch_ua_platform": (
-            data.get("http_sec_ch_ua_platform")
-            or request.headers.get("sec-ch-ua-platform", "")
-            or ""
-        ),
-        "sec_ch_ua_platform_version": (
-            data.get("http_sec_ch_ua_platform_version")
-            or request.headers.get("sec-ch-ua-platform-version", "")
-            or ""
-        ),
-        "sec_ch_ua_full_version_list": (
-            data.get("http_sec_ch_ua_full_version_list")
-            or request.headers.get("sec-ch-ua-full-version-list", "")
-            or ""
-        ),
-        "accept_language": (
-            data.get("http_accept_language")
-            or request.headers.get("accept-language", "")
-            or ""
-        ),
+        "sec_ch_ua": data.get("http_sec_ch_ua") or request.headers.get("sec-ch-ua", "") or "",
+        "sec_ch_ua_platform": data.get("http_sec_ch_ua_platform") or request.headers.get("sec-ch-ua-platform", "") or "",
+        "sec_ch_ua_platform_version": data.get("http_sec_ch_ua_platform_version") or request.headers.get("sec-ch-ua-platform-version", "") or "",
+        "sec_ch_ua_full_version_list": data.get("http_sec_ch_ua_full_version_list") or request.headers.get("sec-ch-ua-full-version-list", "") or "",
+        "accept_language": data.get("http_accept_language") or request.headers.get("accept-language", "") or "",
     }
 
 
@@ -187,15 +213,11 @@ def infer_os(ua_raw: str, ch: dict) -> str:
     platform_version = (ch.get("sec_ch_ua_platform_version", "") or "").replace('"', "").strip()
 
     if platform_name.lower() == "windows":
-        major = 0
         try:
             major = int(platform_version.split(".")[0])
         except Exception:
             major = 0
-
-        if major >= 13:
-            return "Windows 11"
-        return "Windows 10"
+        return "Windows 11" if major >= 13 else "Windows 10"
 
     if platform_name:
         return platform_name
@@ -224,17 +246,18 @@ def device_fingerprint(
     ua_device: str,
     ch: dict,
 ) -> str:
+    stable_browser = (ua_browser or "").split(" ")[0].strip().lower()
+    stable_os = (ua_os or "").strip().lower()
+    stable_device = (ua_device or "").strip().lower()
+    stable_lang = (ch.get("accept_language", "") or "").split(",")[0].strip().lower()
+
     parts = [
-        ua_raw or "",
-        ua_browser or "",
-        ua_os or "",
-        ua_device or "",
-        ch.get("sec_ch_ua", "") or "",
-        ch.get("sec_ch_ua_platform", "") or "",
-        ch.get("sec_ch_ua_platform_version", "") or "",
-        ch.get("sec_ch_ua_full_version_list", "") or "",
-        ch.get("accept_language", "") or "",
+        stable_browser,
+        stable_os,
+        stable_device,
+        stable_lang,
     ]
+
     base = "|".join(parts)
     return hashlib.sha256(base.encode("utf-8")).hexdigest()
 
@@ -245,10 +268,8 @@ def device_fingerprint(
 
 def build_identity_filter(user_id: str, username: str) -> str:
     clauses = []
-
     if user_id:
         clauses.append(f"user_id = '{sql_escape(user_id)}'")
-
     if username:
         clauses.append(f"username = '{sql_escape(username)}'")
 
@@ -259,26 +280,16 @@ def build_identity_filter(user_id: str, username: str) -> str:
 
 
 def build_failure_filter(user_id: str, username: str, ip: str) -> str:
-    """
-    Pour compter les LOGIN_ERROR:
-    - on privilégie l'identité (user_id / username)
-    - on n'utilise l'IP seule que si on n'a aucune identité
-    Cela évite les problèmes de localhost (::1) vs Docker (172.20.0.1).
-    """
     identity_clauses = []
-
     if user_id:
         identity_clauses.append(f"user_id = '{sql_escape(user_id)}'")
-
     if username:
         identity_clauses.append(f"username = '{sql_escape(username)}'")
 
     if identity_clauses:
         return "(" + " OR ".join(identity_clauses) + ")"
-
     if ip:
         return f"(ip = '{sql_escape(ip)}')"
-
     return "1 = 0"
 
 
@@ -287,11 +298,12 @@ def count_login_errors_minutes(
     user_id: str = "",
     username: str = "",
     ip: str = "",
-    ref_time: datetime | None = None,
+    ref_time: Optional[datetime] = None,
 ):
     base_time = ref_time or now_utc()
     since = base_time - timedelta(minutes=window_minutes)
     since_str = since.strftime("%Y-%m-%d %H:%M:%S")
+    until_str = base_time.strftime("%Y-%m-%d %H:%M:%S")
     match_filter = build_failure_filter(user_id, username, ip)
 
     sql = f"""
@@ -300,6 +312,7 @@ def count_login_errors_minutes(
     WHERE {match_filter}
       AND event_type = 'LOGIN_ERROR'
       AND event_time >= toDateTime('{since_str}')
+      AND event_time <= toDateTime('{until_str}')
     """
     return int(ch_query(sql).strip() or "0")
 
@@ -309,11 +322,12 @@ def count_login_errors_hours(
     user_id: str = "",
     username: str = "",
     ip: str = "",
-    ref_time: datetime | None = None,
+    ref_time: Optional[datetime] = None,
 ):
     base_time = ref_time or now_utc()
     since = base_time - timedelta(hours=hours)
     since_str = since.strftime("%Y-%m-%d %H:%M:%S")
+    until_str = base_time.strftime("%Y-%m-%d %H:%M:%S")
     match_filter = build_failure_filter(user_id, username, ip)
 
     sql = f"""
@@ -322,35 +336,42 @@ def count_login_errors_hours(
     WHERE {match_filter}
       AND event_type = 'LOGIN_ERROR'
       AND event_time >= toDateTime('{since_str}')
+      AND event_time <= toDateTime('{until_str}')
     """
     return int(ch_query(sql).strip() or "0")
 
 
-def login_count_hours(hours: int, user_id: str = "", username: str = ""):
-    since = now_utc() - timedelta(hours=hours)
+def login_count_hours(
+    hours: int,
+    user_id: str = "",
+    username: str = "",
+    ref_time: Optional[datetime] = None,
+):
+    base_time = ref_time or now_utc()
+    since = base_time - timedelta(hours=hours)
     since_str = since.strftime("%Y-%m-%d %H:%M:%S")
+    until_str = base_time.strftime("%Y-%m-%d %H:%M:%S")
     identity_filter = build_identity_filter(user_id, username)
 
     sql = f"""
     SELECT count()
     FROM {TABLE}
     WHERE {identity_filter}
-      AND event_type = 'LOGIN'
+      AND event_type IN ('LOGIN', 'APP_SESSION_STARTED')
       AND event_success = 1
       AND event_time >= toDateTime('{since_str}')
+      AND event_time <= toDateTime('{until_str}')
     """
     return int(ch_query(sql).strip() or "0")
 
 
 def is_new_device(user_id: str, username: str, fp: str):
-    fp = sql_escape(fp)
     identity_filter = build_identity_filter(user_id, username)
-
     sql = f"""
     SELECT count()
     FROM {TABLE}
     WHERE {identity_filter}
-      AND device_fp = '{fp}'
+      AND device_fp = '{sql_escape(fp)}'
     """
     return 1 if int(ch_query(sql).strip() or "0") == 0 else 0
 
@@ -358,20 +379,23 @@ def is_new_device(user_id: str, username: str, fp: str):
 def is_new_ip_for_user(user_id: str, username: str, ip: str):
     if not ip:
         return 0
-
-    ip = sql_escape(ip)
     identity_filter = build_identity_filter(user_id, username)
-
     sql = f"""
     SELECT count()
     FROM {TABLE}
     WHERE {identity_filter}
-      AND ip = '{ip}'
+      AND ip = '{sql_escape(ip)}'
     """
     return 1 if int(ch_query(sql).strip() or "0") == 0 else 0
 
 
-def get_last_distinct_successful_location(user_id: str, username: str, current_ip: str, current_lat: float, current_lon: float):
+def get_last_distinct_successful_location(
+    user_id: str,
+    username: str,
+    current_ip: str,
+    current_lat: float,
+    current_lon: float,
+):
     identity_filter = build_identity_filter(user_id, username)
     current_ip = sql_escape(current_ip)
 
@@ -379,7 +403,7 @@ def get_last_distinct_successful_location(user_id: str, username: str, current_i
     SELECT ip, geo_latitude, geo_longitude, event_time
     FROM {TABLE}
     WHERE {identity_filter}
-      AND event_type = 'LOGIN'
+      AND event_type IN ('LOGIN', 'APP_SESSION_STARTED')
       AND event_success = 1
       AND geo_latitude != 0
       AND geo_longitude != 0
@@ -390,8 +414,7 @@ def get_last_distinct_successful_location(user_id: str, username: str, current_i
     if not result:
         return None
 
-    rows = result.splitlines()
-    for row in rows:
+    for row in result.splitlines():
         parts = row.split("\t")
         if len(parts) != 4:
             continue
@@ -406,7 +429,6 @@ def get_last_distinct_successful_location(user_id: str, username: str, current_i
 
         same_ip = prev_ip == current_ip
         same_coords = abs(prev_lat - current_lat) < 0.0001 and abs(prev_lon - current_lon) < 0.0001
-
         if same_ip and same_coords:
             continue
 
@@ -423,6 +445,8 @@ def get_last_distinct_successful_location(user_id: str, username: str, current_i
 def app_sensitivity(client_id: str):
     mapping = {
         "portal-client-5": 1,
+        "portal-main-client": 1,
+        "portal-stepup-totp-client": 1,
         "crm-client-2": 2,
         "hr-client-4": 3,
         "finance-client-3": 4,
@@ -437,7 +461,6 @@ def app_sensitivity(client_id: str):
 
 def haversine_km(lat1, lon1, lat2, lon2):
     r = 6371.0
-
     phi1 = math.radians(lat1)
     phi2 = math.radians(lat2)
     dphi = math.radians(lat2 - lat1)
@@ -445,11 +468,17 @@ def haversine_km(lat1, lon1, lat2, lon2):
 
     a = math.sin(dphi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
     return r * c
 
 
-def compute_travel_features(user_id: str, username: str, current_ip: str, current_lat: float, current_lon: float, current_time: datetime):
+def compute_travel_features(
+    user_id: str,
+    username: str,
+    current_ip: str,
+    current_lat: float,
+    current_lon: float,
+    current_time: datetime,
+):
     if current_lat == 0 or current_lon == 0:
         return 0.0, 0
 
@@ -464,18 +493,10 @@ def compute_travel_features(user_id: str, username: str, current_ip: str, curren
     if not previous:
         return 0.0, 0
 
-    distance_km = haversine_km(
-        previous["lat"],
-        previous["lon"],
-        current_lat,
-        current_lon,
-    )
-
+    distance_km = haversine_km(previous["lat"], previous["lon"], current_lat, current_lon)
     delta_hours = max((current_time - previous["event_time"]).total_seconds() / 3600.0, 0.001)
     speed_kmh = distance_km / delta_hours
-
     is_impossible = 1 if distance_km >= 500 and speed_kmh >= 900 else 0
-
     return round(distance_km, 2), is_impossible
 
 
@@ -556,14 +577,13 @@ def score_event(features: dict) -> dict:
         return default_response
 
     try:
-        response = requests.post(
+        response = _http.post(
             SCORING_URL,
             json=features,
             timeout=SCORING_TIMEOUT,
         )
         response.raise_for_status()
         payload = response.json()
-
         return {
             "risk_score": payload.get("risk_score"),
             "risk_label": payload.get("risk_label", "unknown"),
@@ -573,7 +593,6 @@ def score_event(features: dict) -> dict:
             "policy_reason": payload.get("policy_reason", "unknown_policy_reason"),
             "scoring_status": "ok",
         }
-
     except Exception as e:
         print(f"[SCORING] Error calling scoring service: {e}")
         return {
@@ -629,7 +648,6 @@ def build_event_context(data: dict, req: Request, event_type: str = "ASSESS"):
     )
 
     ch = extract_client_hints(data, req)
-
     ua_browser = infer_browser(ua_raw, ch)
     ua_os = infer_os(ua_raw, ch)
     ua_device = infer_device(ua_raw)
@@ -644,7 +662,7 @@ def build_event_context(data: dict, req: Request, event_type: str = "ASSESS"):
         event_success = 1 if not error else 0
     elif event_type == "LOGIN_ERROR":
         event_success = 0
-    elif event_type in ["APP_SESSION_STARTED", "LOGOUT", "ASSESS"]:
+    elif event_type in ["APP_SESSION_STARTED", "ASSESS", "LOGOUT"]:
         event_success = 1
     else:
         event_success = 0 if error else 1
@@ -659,54 +677,20 @@ def build_event_context(data: dict, req: Request, event_type: str = "ASSESS"):
 
     identity_available = bool(user_id or username)
 
-    print(
-        "[IDENTITY DEBUG]",
-        json.dumps(
-            {
-                "event_type": event_type,
-                "user_id": user_id,
-                "username": username,
-                "ip": ip,
-                "error": error,
-                "details": details,
-            },
-            ensure_ascii=False,
-        ),
-    )
-
-    fails_5m = count_login_errors_minutes(
-    5,
-    user_id=user_id,
-    username=username,
-    ip=ip,
-    ref_time=event_time,
-    )
-    fails_1h = count_login_errors_hours(
-    1,
-    user_id=user_id,
-    username=username,
-    ip=ip,
-    ref_time=event_time,
-    )
-    fails_24h = count_login_errors_hours(
-    24,
-    user_id=user_id,
-    username=username,
-    ip=ip,
-    ref_time=event_time,
-    )
+    fails_5m = count_login_errors_minutes(5, user_id=user_id, username=username, ip=ip, ref_time=event_time)
+    fails_1h = count_login_errors_hours(1, user_id=user_id, username=username, ip=ip, ref_time=event_time)
+    fails_24h = count_login_errors_hours(24, user_id=user_id, username=username, ip=ip, ref_time=event_time)
 
     login_1h = 0
     new_dev = 0
     new_ip = 0
 
     if identity_available:
-        login_1h = login_count_hours(1, user_id=user_id, username=username)
+        login_1h = login_count_hours(1, user_id=user_id, username=username, ref_time=event_time)
         new_dev = is_new_device(user_id, username, fp)
         new_ip = is_new_ip_for_user(user_id, username, ip)
 
     ip_data = enrich_ip(ip)
-
     abuse = ip_data.get("abuseipdb", {}) or {}
     geo = ip_data.get("geolite2", {}) or {}
 
@@ -734,12 +718,7 @@ def build_event_context(data: dict, req: Request, event_type: str = "ASSESS"):
 
     asn_value = 0
     asn_org = ""
-
-    for candidate in [
-        geo.get("asn"),
-        geo.get("autonomous_system_number"),
-        ip_data.get("asn"),
-    ]:
+    for candidate in [geo.get("asn"), ip_data.get("asn")]:
         try:
             if candidate is not None and str(candidate).strip() != "":
                 asn_value = int(candidate)
@@ -747,12 +726,7 @@ def build_event_context(data: dict, req: Request, event_type: str = "ASSESS"):
         except Exception:
             pass
 
-    for candidate in [
-        geo.get("asn_org"),
-        geo.get("autonomous_system_organization"),
-        ip_data.get("asn_org"),
-        abuse.get("isp"),
-    ]:
+    for candidate in [geo.get("asn_org"), ip_data.get("asn_org"), abuse.get("isp")]:
         if candidate and str(candidate).strip():
             asn_org = str(candidate).strip()
             break
@@ -761,7 +735,18 @@ def build_event_context(data: dict, req: Request, event_type: str = "ASSESS"):
 
     distance_from_last_location_km = 0.0
     is_impossible_travel = 0
-    if event_type == "LOGIN" and event_success == 1:
+
+    trusted_geo = (
+        event_type in ("LOGIN", "APP_SESSION_STARTED")
+        and event_success == 1
+        and ip
+        and is_public_ip(ip)
+        and vpn_proxy["is_vpn_detected"] == 0
+        and vpn_proxy["is_proxy_detected"] == 0
+        and geo_country_code != ""
+    )
+
+    if trusted_geo and identity_available:
         distance_from_last_location_km, is_impossible_travel = compute_travel_features(
             user_id=user_id,
             username=username,
@@ -773,6 +758,7 @@ def build_event_context(data: dict, req: Request, event_type: str = "ASSESS"):
 
     app_sens = app_sensitivity(client_id)
 
+    # IMPORTANT: garde cette liste strictement alignée avec le features.json du scoring-service
     scoring_features = {
         "client_id": client_id or "unknown",
         "app_sensitivity": app_sens,
@@ -841,6 +827,77 @@ def build_event_context(data: dict, req: Request, event_type: str = "ASSESS"):
         "distance_from_last_location_km": distance_from_last_location_km,
         "is_impossible_travel": is_impossible_travel,
         "scoring_features": scoring_features,
+        "abuse_details": abuse,
+        "ip_enrichment": ip_data,
+    }
+
+
+def row_from_context(context: dict, scoring_result: Optional[dict] = None) -> dict:
+    scoring_result = scoring_result or {
+        "risk_score": None,
+        "risk_label": "not_applicable",
+        "decision": "NOT_SCORED",
+        "required_factor": "NONE",
+        "auth_path": "NONE",
+        "policy_reason": "event_type_not_scored",
+        "scoring_status": "skipped",
+    }
+
+    return {
+        "event_time": context["event_time"].strftime("%Y-%m-%d %H:%M:%S"),
+        "realm": context["realm"],
+        "client_id": context["client_id"],
+        "user_id": context["user_id"],
+        "username": context["username"],
+        "event_type": context["event_type"],
+        "ip": context["ip"],
+        "error": context["error"],
+        "ua_raw": context["ua_raw"],
+        "ua_browser": context["ua_browser"],
+        "ua_os": context["ua_os"],
+        "ua_device": context["ua_device"],
+        "device_fp": context["device_fp"],
+        "is_new_device": context["is_new_device"],
+        "is_new_ip_for_user": context["is_new_ip_for_user"],
+        "hour": context["hour"],
+        "day_of_week": context["day_of_week"],
+        "is_weekend": context["is_weekend"],
+        "is_night_login": context["is_night_login"],
+        "is_business_hours": context["is_business_hours"],
+        "fails_5m": context["fails_5m"],
+        "fails_1h": context["fails_1h"],
+        "fails_24h": context["fails_24h"],
+        "login_1h": context["login_1h"],
+        "event_success": context["event_success"],
+        "app_sensitivity": context["app_sensitivity"],
+        "country": context["country"],
+        "city": context["city"],
+        "isp": context["isp"],
+        "org": context["org"],
+        "asn": context["asn"],
+        "asn_org": context["asn_org"],
+        "is_tor": context["is_tor"],
+        "abuse_confidence_score": context["abuse_confidence_score"],
+        "geo_country": context["geo_country"],
+        "geo_city": context["geo_city"],
+        "geo_country_code": context["geo_country_code"],
+        "geo_postal_code": context["geo_postal_code"],
+        "geo_latitude": context["geo_latitude"],
+        "geo_longitude": context["geo_longitude"],
+        "geo_timezone": context["geo_timezone"],
+        "is_vpn_detected": context["is_vpn_detected"],
+        "vpn_provider": context["vpn_provider"],
+        "is_proxy_detected": context["is_proxy_detected"],
+        "proxy_provider": context["proxy_provider"],
+        "distance_from_last_location_km": context["distance_from_last_location_km"],
+        "is_impossible_travel": context["is_impossible_travel"],
+        "risk_score": scoring_result["risk_score"],
+        "risk_label": scoring_result["risk_label"],
+        "decision": scoring_result["decision"],
+        "required_factor": scoring_result["required_factor"],
+        "auth_path": scoring_result["auth_path"],
+        "policy_reason": scoring_result["policy_reason"],
+        "scoring_status": scoring_result["scoring_status"],
     }
 
 
@@ -855,14 +912,23 @@ def root():
         "service": "event-collector",
         "scoring_enabled": SCORING_ENABLED,
         "scoring_url": SCORING_URL,
+        "clickhouse_db": CLICKHOUSE_DB,
+        "clickhouse_table": TABLE,
     }
 
 
 @app.get("/health")
 def health():
+    try:
+        ch_query("SELECT 1")
+        clickhouse_status = "ok"
+    except Exception as e:
+        clickhouse_status = f"error: {e}"
+
     return {
         "status": "ok",
         "service": "event-collector",
+        "clickhouse": clickhouse_status,
     }
 
 
@@ -881,23 +947,8 @@ async def check_password(req: Request):
 @app.post("/assess")
 async def assess_event(req: Request):
     data = await req.json()
-
     context = build_event_context(data, req, event_type="ASSESS")
     scoring_result = score_event(context["scoring_features"])
-
-    print(
-        "[ASSESS]",
-        json.dumps(
-            {
-                "username": context["username"],
-                "user_id": context["user_id"],
-                "client_id": context["client_id"],
-                "features": context["scoring_features"],
-                "scoring": scoring_result,
-            },
-            ensure_ascii=False,
-        ),
-    )
 
     return {
         "status": "ok",
@@ -919,79 +970,24 @@ async def assess_event(req: Request):
 
 @app.post("/events")
 async def receive_event(req: Request):
-    data = await req.json()
+    try:
+        data = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload")
+
     event_type = data.get("type", "") or "UNKNOWN"
+    tracked_for_scoring = {"LOGIN", "LOGIN_ERROR", "APP_SESSION_STARTED"}
 
     context = build_event_context(data, req, event_type=event_type)
-    scoring_result = score_event(context["scoring_features"])
 
-    row = {
-        "event_time": context["event_time"].strftime("%Y-%m-%d %H:%M:%S"),
-        "realm": context["realm"],
-        "client_id": context["client_id"],
-        "user_id": context["user_id"],
-        "username": context["username"],
-        "event_type": context["event_type"],
-        "ip": context["ip"],
-        "error": context["error"],
-
-        "ua_raw": context["ua_raw"],
-        "ua_browser": context["ua_browser"],
-        "ua_os": context["ua_os"],
-        "ua_device": context["ua_device"],
-        "device_fp": context["device_fp"],
-        "is_new_device": context["is_new_device"],
-        "is_new_ip_for_user": context["is_new_ip_for_user"],
-
-        "hour": context["hour"],
-        "day_of_week": context["day_of_week"],
-        "is_weekend": context["is_weekend"],
-        "is_night_login": context["is_night_login"],
-        "is_business_hours": context["is_business_hours"],
-
-        "fails_5m": context["fails_5m"],
-        "fails_1h": context["fails_1h"],
-        "fails_24h": context["fails_24h"],
-        "login_1h": context["login_1h"],
-        "event_success": context["event_success"],
-        "app_sensitivity": context["app_sensitivity"],
-
-        "country": context["country"],
-        "city": context["city"],
-        "isp": context["isp"],
-        "org": context["org"],
-        "asn": context["asn"],
-        "asn_org": context["asn_org"],
-
-        "is_tor": context["is_tor"],
-        "abuse_confidence_score": context["abuse_confidence_score"],
-
-        "geo_country": context["geo_country"],
-        "geo_city": context["geo_city"],
-        "geo_country_code": context["geo_country_code"],
-        "geo_postal_code": context["geo_postal_code"],
-        "geo_latitude": context["geo_latitude"],
-        "geo_longitude": context["geo_longitude"],
-        "geo_timezone": context["geo_timezone"],
-
-        "is_vpn_detected": context["is_vpn_detected"],
-        "vpn_provider": context["vpn_provider"],
-        "is_proxy_detected": context["is_proxy_detected"],
-        "proxy_provider": context["proxy_provider"],
-
-        "distance_from_last_location_km": context["distance_from_last_location_km"],
-        "is_impossible_travel": context["is_impossible_travel"],
-
-        "risk_score": scoring_result["risk_score"],
-        "risk_label": scoring_result["risk_label"],
-        "decision": scoring_result["decision"],
-        "required_factor": scoring_result["required_factor"],
-        "auth_path": scoring_result["auth_path"],
-        "policy_reason": scoring_result["policy_reason"],
-        "scoring_status": scoring_result["scoring_status"],
-    }
-
-    print("RECEIVED EVENT:", json.dumps(row, indent=2, ensure_ascii=False))
+    if event_type in tracked_for_scoring:
+        scoring_result = score_event(context["scoring_features"])
+        row = row_from_context(context, scoring_result)
+    else:
+        row = row_from_context(context, None)
+        scoring_result = {
+            "scoring_status": "skipped",
+        }
 
     insert_event(row)
 
@@ -999,13 +995,5 @@ async def receive_event(req: Request):
         "status": "ok",
         "stored": True,
         "features": row,
-        "scoring": {
-            "risk_score": scoring_result["risk_score"],
-            "risk_label": scoring_result["risk_label"],
-            "decision": scoring_result["decision"],
-            "required_factor": scoring_result["required_factor"],
-            "auth_path": scoring_result["auth_path"],
-            "policy_reason": scoring_result["policy_reason"],
-            "scoring_status": scoring_result["scoring_status"],
-        },
+        "scoring": scoring_result,
     }

@@ -1,10 +1,6 @@
 const express = require("express");
 const session = require("express-session");
 const dotenv = require("dotenv");
-const speakeasy = require("speakeasy");
-const QRCode = require("qrcode");
-const fs = require("fs");
-const path = require("path");
 const { Issuer } = require("openid-client");
 
 dotenv.config();
@@ -35,12 +31,23 @@ app.use((req, res, next) => {
   next();
 });
 
-const KC_BASE_URL = (process.env.KC_BASE_URL || "http://localhost:8081").trim().replace(/\/+$/, "");
-const KC_PUBLIC_URL = (process.env.KC_PUBLIC_URL || KC_BASE_URL).trim().replace(/\/+$/, "");
+const KC_BASE_URL = (process.env.KC_BASE_URL || "http://localhost:8081")
+  .trim()
+  .replace(/\/+$/, "");
+const KC_PUBLIC_URL = (process.env.KC_PUBLIC_URL || KC_BASE_URL)
+  .trim()
+  .replace(/\/+$/, "");
 const KC_REALM = (process.env.KC_REALM || "PFE-SSO").trim();
 
-const CLIENT_ID = (process.env.PORTAL_CLIENT_ID || "portal-client-5").trim();
+const CLIENT_ID = (process.env.PORTAL_CLIENT_ID || "portal-main-client").trim();
 const CLIENT_SECRET = (process.env.PORTAL_CLIENT_SECRET || "").trim();
+
+const STEPUP_TOTP_CLIENT_ID = (
+  process.env.PORTAL_STEPUP_TOTP_CLIENT_ID || "portal-stepup-totp-client"
+).trim();
+const STEPUP_TOTP_CLIENT_SECRET = (
+  process.env.PORTAL_STEPUP_TOTP_CLIENT_SECRET || ""
+).trim();
 
 const EVENT_COLLECTOR_URL = (
   process.env.EVENT_COLLECTOR_URL || "http://localhost:8088/events"
@@ -56,26 +63,26 @@ const CHECK_PASSWORD_URL = (
 
 const BIOMETRIC_SERVICE_URL = (
   process.env.BIOMETRIC_SERVICE_URL || "http://localhost:8091"
-).trim().replace(/\/+$/, "");
+)
+  .trim()
+  .replace(/\/+$/, "");
 
 const APP_BASE_URL = (
   process.env.PORTAL_BASE_URL || `http://localhost:${PORT}`
-).trim().replace(/\/+$/, "");
+)
+  .trim()
+  .replace(/\/+$/, "");
 
 const REDIRECT_URI = `${APP_BASE_URL}/callback`;
-
-const SHARED_DATA_DIR = process.env.SHARED_DATA_DIR?.trim()
-  ? path.resolve(process.env.SHARED_DATA_DIR.trim())
-  : path.join(__dirname, "..", "shared-data");
-
-const TOTP_STORE_PATH = process.env.TOTP_STORE_PATH?.trim()
-  ? path.resolve(process.env.TOTP_STORE_PATH.trim())
-  : path.join(SHARED_DATA_DIR, "totp-store.json");
-
-fs.mkdirSync(SHARED_DATA_DIR, { recursive: true });
+const STEPUP_TOTP_REDIRECT_URI = `${APP_BASE_URL}/callback-stepup-totp`;
 
 if (!CLIENT_SECRET) {
   console.error("[portal] PORTAL_CLIENT_SECRET missing in .env");
+  process.exit(1);
+}
+
+if (!STEPUP_TOTP_CLIENT_SECRET) {
+  console.error("[portal] PORTAL_STEPUP_TOTP_CLIENT_SECRET missing in .env");
   process.exit(1);
 }
 
@@ -92,7 +99,8 @@ app.use(
   })
 );
 
-let client;
+let portalClient;
+let stepupTotpClient;
 let issuerUrl;
 
 function decodeJwtPayload(token) {
@@ -122,9 +130,7 @@ async function buildClient({
   clientSecret,
   redirectUri,
 }) {
-  const issuer = await Issuer.discover(
-    `${kcBaseUrl}/realms/${realm}`
-  );
+  const issuer = await Issuer.discover(`${kcBaseUrl}/realms/${realm}`);
 
   const oidcClient = new issuer.Client({
     client_id: clientId,
@@ -139,39 +145,6 @@ async function buildClient({
     client: oidcClient,
   };
 }
-
-function loadTotpStoreFromDisk() {
-  try {
-    if (!fs.existsSync(TOTP_STORE_PATH)) {
-      return new Map();
-    }
-
-    const raw = fs.readFileSync(TOTP_STORE_PATH, "utf8");
-    if (!raw.trim()) return new Map();
-
-    const parsed = JSON.parse(raw);
-    if (!parsed || typeof parsed !== "object") return new Map();
-
-    return new Map(Object.entries(parsed));
-  } catch (err) {
-    console.error("[portal] unable to load TOTP store:", err);
-    return new Map();
-  }
-}
-
-function persistTotpStore() {
-  try {
-    const payload = Object.fromEntries(appTotpStore.entries());
-    const tmpPath = `${TOTP_STORE_PATH}.tmp`;
-
-    fs.writeFileSync(tmpPath, JSON.stringify(payload, null, 2), "utf8");
-    fs.renameSync(tmpPath, TOTP_STORE_PATH);
-  } catch (err) {
-    console.error("[portal] unable to persist TOTP store:", err);
-  }
-}
-
-const appTotpStore = loadTotpStoreFromDisk();
 
 function getClientIp(req) {
   return (
@@ -232,33 +205,18 @@ function renderAdaptiveDecision(res, title, message, details, actions = "") {
   );
 }
 
-function getUserTotpRecord(user) {
-  const key = user?.sub;
-  if (!key) return null;
-  return appTotpStore.get(key) || null;
-}
-
-function setUserTotpRecord(user, record) {
-  const key = user?.sub;
-  if (!key) return;
-
-  appTotpStore.set(key, record);
-  persistTotpStore();
-}
-
 function requirePortalAccess(req, res, next) {
   const publicPaths = [
     "/login",
     "/callback",
+    "/callback-stepup-totp",
     "/logout",
     "/adaptive-stepup",
     "/adaptive-blocked",
-    "/adaptive-totp-verify",
     "/adaptive-biometric-verify",
-    "/security/setup-totp",
-    "/security/setup-totp/verify",
     "/security/setup-face",
     "/security/setup-face/capture",
+    "/security/manage-keycloak-otp",
   ];
 
   if (publicPaths.includes(req.path)) return next();
@@ -309,7 +267,7 @@ const styles = `
       box-shadow: 0 8px 16px rgba(0, 0, 0, 0.1);
       text-align: center;
       width: 100%;
-      max-width: 560px;
+      max-width: 620px;
     }
     h2 {
       color: #2c3e50;
@@ -383,26 +341,6 @@ const styles = `
       margin-bottom: 18px;
       text-align: left;
     }
-    .qr-wrap {
-      margin: 16px 0 20px 0;
-    }
-    img.qr {
-      max-width: 220px;
-      width: 100%;
-      height: auto;
-      border: 1px solid #e5e7eb;
-      border-radius: 8px;
-      padding: 10px;
-      background: #fff;
-    }
-    code.secret {
-      display: block;
-      padding: 10px;
-      background: #f3f4f6;
-      border-radius: 6px;
-      word-break: break-all;
-      margin: 12px 0 16px 0;
-    }
   </style>
 `;
 
@@ -410,7 +348,7 @@ app.use(requirePortalAccess);
 
 (async () => {
   try {
-    const built = await buildClient({
+    const portalBuilt = await buildClient({
       kcBaseUrl: KC_BASE_URL,
       realm: KC_REALM,
       clientId: CLIENT_ID,
@@ -418,13 +356,22 @@ app.use(requirePortalAccess);
       redirectUri: REDIRECT_URI,
     });
 
-    client = built.client;
-    issuerUrl = built.issuerUrl;
+    const stepupBuilt = await buildClient({
+      kcBaseUrl: KC_BASE_URL,
+      realm: KC_REALM,
+      clientId: STEPUP_TOTP_CLIENT_ID,
+      clientSecret: STEPUP_TOTP_CLIENT_SECRET,
+      redirectUri: STEPUP_TOTP_REDIRECT_URI,
+    });
+
+    portalClient = portalBuilt.client;
+    stepupTotpClient = stepupBuilt.client;
+    issuerUrl = portalBuilt.issuerUrl;
 
     console.log(`[portal] ready: ${APP_BASE_URL}`);
     console.log(`[portal] issuerUrl: ${issuerUrl}`);
     console.log(`[portal] redirectUri: ${REDIRECT_URI}`);
-    console.log(`[portal] shared TOTP store: ${TOTP_STORE_PATH}`);
+    console.log(`[portal] stepup redirectUri: ${STEPUP_TOTP_REDIRECT_URI}`);
   } catch (err) {
     console.error("[portal] OIDC init error full:", err);
     console.error("[portal] OIDC init error message:", err?.message || err);
@@ -442,7 +389,6 @@ app.get("/", async (req, res) => {
     req.session.user.preferred_username || req.session.user.email || "user";
   const roles = (req.session.user.roles || []).join(", ") || "none";
   const adaptive = req.session.adaptiveAuth || {};
-  const totp = getUserTotpRecord(req.session.user);
 
   let biometricStatus = { enrolled: false };
   try {
@@ -484,12 +430,10 @@ app.get("/", async (req, res) => {
     : `<p><b>Adaptive auth:</b> not evaluated</p>`;
 
   const totpInfo = `
-    <p><b>TOTP app setup:</b> ${totp?.verified ? "configured" : "not configured"}</p>
-    ${
-      totp?.verified
-        ? `<p class="small">Dernière configuration TOTP : ${totp.enrolled_at || "n/a"}</p>`
-        : ""
-    }
+    <p><b>TOTP:</b> géré nativement par Keycloak</p>
+    <p class="small">
+      En cas de changement de téléphone, il faut réenrôler ou réinitialiser l’OTP côté Keycloak.
+    </p>
   `;
 
   const biometricInfo = `
@@ -510,7 +454,7 @@ app.get("/", async (req, res) => {
         ${adaptiveInfo}
         ${totpInfo}
         ${biometricInfo}
-        <a href="/security/setup-totp" class="btn btn-success">Configurer TOTP</a>
+        
         <a href="/security/setup-face" class="btn btn-success">Configurer biométrie faciale</a>
         <a href="/protected" class="btn btn-secondary">Page protégée</a>
         <a href="/logout" class="btn btn-logout">Logout</a>
@@ -520,13 +464,15 @@ app.get("/", async (req, res) => {
 });
 
 app.get("/login", (req, res) => {
-  if (!client) return res.status(503).send("OIDC client not ready, retry.");
+  if (!portalClient) return res.status(503).send("OIDC client not ready, retry.");
   res.redirect(
-    client.authorizationUrl({
+    portalClient.authorizationUrl({
       scope: "openid profile email",
     })
   );
 });
+
+
 
 async function sendAppSessionStartedEvent({ userinfo, ip, ua, ch, sessionId }) {
   const payload = {
@@ -688,9 +634,9 @@ function renderBiometricCapturePage({
   challengeType = "turn_left",
 }) {
   const challengeLabel =
-  challengeType === "turn_left"
-    ? "Tourne légèrement la tête vers ta droite (effet miroir caméra)"
-    : "Tourne légèrement la tête vers ta gauche (effet miroir caméra)";
+    challengeType === "turn_left"
+      ? "Tourne légèrement la tête vers ta droite (effet miroir caméra)"
+      : "Tourne légèrement la tête vers ta gauche (effet miroir caméra)";
 
   return htmlPage(
     title,
@@ -800,111 +746,13 @@ function renderBiometricCapturePage({
   );
 }
 
-async function buildTotpSetupPage(user, { forceReset = false } = {}) {
-  const username = user.preferred_username || user.email || user.sub || "user";
-  let record = getUserTotpRecord(user);
-
-  if (record?.base32 && record.verified === true && !forceReset && !record.pending_base32) {
-    return htmlPage(
-      "TOTP déjà configuré",
-      `
-        <p>Le second facteur TOTP est déjà configuré pour cet utilisateur.</p>
-        <p><b>Utilisateur :</b> ${username}</p>
-        <p><b>Date d’enrôlement :</b> ${record.enrolled_at || "n/a"}</p>
-        <p class="small">Le secret TOTP est maintenant stocké de façon persistante dans un store partagé entre toutes les apps.</p>
-        <a href="/security/setup-totp?reset=1" class="btn btn-secondary">Réinitialiser le TOTP</a>
-        <a href="/" class="btn btn-success">Retour à l’accueil</a>
-        <a href="/logout" class="btn btn-logout">Logout</a>
-      `
-    );
-  }
-
-  if (forceReset || !record || !record.pending_base32) {
-    const secret = speakeasy.generateSecret({
-      name: `PFE-SSO (${username})`,
-      issuer: "PFE-SSO",
-      length: 20,
-    });
-
-    record = {
-      pending_base32: secret.base32,
-      pending_otpauth_url: secret.otpauth_url,
-      verified: false,
-      created_at: new Date().toISOString(),
-    };
-
-    setUserTotpRecord(user, record);
-  }
-
-  const qrDataUrl = await QRCode.toDataURL(record.pending_otpauth_url);
-
-  return htmlPage(
-    "Configuration TOTP",
-    `
-      <p>Configure ton second facteur dans un contexte sûr avant d’utiliser le step-up adaptatif.</p>
-      <div class="qr-wrap">
-        <img class="qr" src="${qrDataUrl}" alt="QR Code TOTP" />
-      </div>
-      <p class="small">Secret manuel :</p>
-      <code class="secret">${record.pending_base32}</code>
-
-      <form method="post" action="/security/setup-totp/verify">
-        <input class="field" type="text" name="token" maxlength="6" placeholder="Entre le code TOTP à 6 chiffres" required />
-        <button type="submit" class="btn btn-success">Valider la configuration TOTP</button>
-      </form>
-
-      <a href="/" class="btn btn-secondary">Retour</a>
-      <a href="/logout" class="btn btn-logout">Logout</a>
-    `
-  );
-}
-
-function renderTotpVerifyPage(errorMessage = "", adaptive = {}) {
-  return htmlPage(
-    "Second facteur requis",
-    `
-      <p>Le niveau de risque est modéré. Un second facteur réel de type TOTP est demandé.</p>
-      <p><b>Policy reason:</b> ${adaptive.policy_reason || "n/a"}</p>
-      <p><b>Risk score:</b> ${adaptive.risk_score ?? "n/a"}</p>
-      ${errorMessage ? `<p class="error">${errorMessage}</p>` : ""}
-      <form method="post" action="/adaptive-totp-verify">
-        <input class="field" type="text" name="token" maxlength="6" placeholder="Entrez le code TOTP à 6 chiffres" required />
-        <button type="submit" class="btn btn-success">Vérifier le code TOTP</button>
-      </form>
-      <a href="/logout" class="btn btn-logout">Logout</a>
-    `
-  );
-}
-
-function renderTotpNotEnrolledPage(user, adaptive = {}) {
-  const username = user?.preferred_username || user?.email || "user";
-
-  return htmlPage(
-    "Second facteur non initialisé",
-    `
-      <p>Le niveau de risque est modéré et un second facteur TOTP est requis.</p>
-      <div class="info-box">
-        <p><b>Utilisateur :</b> ${username}</p>
-        <p><b>Problème :</b> aucun TOTP partagé n’a été préalablement configuré.</p>
-        <p><b>Policy reason:</b> ${adaptive.policy_reason || "n/a"}</p>
-        <p><b>Risk score:</b> ${adaptive.risk_score ?? "n/a"}</p>
-        <p class="small">
-          Configure d’abord le TOTP depuis une session normale et de confiance.
-        </p>
-      </div>
-      <a href="/" class="btn btn-secondary">Retour</a>
-      <a href="/logout" class="btn btn-logout">Logout</a>
-    `
-  );
-}
-
 app.get("/callback", async (req, res) => {
   try {
-    if (!client) return res.status(503).send("OIDC client not ready, retry.");
+    if (!portalClient) return res.status(503).send("OIDC client not ready, retry.");
 
-    const params = client.callbackParams(req);
-    const tokenSet = await client.callback(REDIRECT_URI, params);
-    const userinfo = await client.userinfo(tokenSet.access_token);
+    const params = portalClient.callbackParams(req);
+    const tokenSet = await portalClient.callback(REDIRECT_URI, params);
+    const userinfo = await portalClient.userinfo(tokenSet.access_token);
 
     const roles = extractRealmRoles(tokenSet.access_token);
     const ip = getClientIp(req);
@@ -973,10 +821,21 @@ app.get("/callback", async (req, res) => {
       return res.redirect("/");
     }
 
-    if (
-      adaptiveDecision.decision === "STEP_UP_TOTP" ||
-      adaptiveDecision.decision === "STEP_UP_BIOMETRIC"
-    ) {
+    if (adaptiveDecision.decision === "STEP_UP_TOTP") {
+      req.session.pendingStepup = {
+        type: "KEYCLOAK_TOTP",
+        created_at: new Date().toISOString(),
+      };
+
+      return res.redirect(
+        stepupTotpClient.authorizationUrl({
+          scope: "openid profile email",
+          prompt: "login",
+        })
+      );
+    }
+
+    if (adaptiveDecision.decision === "STEP_UP_BIOMETRIC") {
       return res.redirect("/adaptive-stepup");
     }
 
@@ -996,80 +855,43 @@ app.get("/callback", async (req, res) => {
   }
 });
 
-app.get("/security/setup-totp", async (req, res) => {
-  if (!req.session.user) return res.redirect("/login");
-
-  const adaptive = req.session.adaptiveAuth || {};
-  if (adaptive.completed === false && adaptive.decision !== "ALLOW") {
-    return res.status(403).send(
-      htmlPage(
-        "Configuration refusée",
-        `
-          <p>La configuration TOTP n'est pas autorisée pendant une session jugée suspecte.</p>
-          <p><b>Policy reason:</b> ${adaptive.policy_reason || "n/a"}</p>
-          <p><b>Risk score:</b> ${adaptive.risk_score ?? "n/a"}</p>
-          <p class="small">Reconnecte-toi dans un contexte normal, ou finalise d’abord le contrôle en cours.</p>
-          <a href="/" class="btn btn-secondary">Retour</a>
-          <a href="/logout" class="btn btn-logout">Logout</a>
-        `
-      )
-    );
-  }
-
-  const forceReset = String(req.query.reset || "").trim() === "1";
-  const page = await buildTotpSetupPage(req.session.user, { forceReset });
-  return res.send(page);
-});
-
-app.post("/security/setup-totp/verify", (req, res) => {
-  if (!req.session.user) return res.redirect("/login");
-
-  const token = String(req.body.token || "").trim().replace(/\s+/g, "");
-  const record = getUserTotpRecord(req.session.user);
-
-  if (!record?.pending_base32) {
-    if (record?.base32 && record.verified === true) {
-      return res.redirect("/");
+app.get("/callback-stepup-totp", async (req, res) => {
+  try {
+    if (!stepupTotpClient) {
+      return res.status(503).send("Step-up OIDC client not ready, retry.");
     }
-    return res.redirect("/security/setup-totp");
-  }
 
-  const isValid = speakeasy.totp.verify({
-    secret: record.pending_base32,
-    encoding: "base32",
-    token,
-    window: 1,
-  });
-
-  if (!isValid) {
-    return res.status(400).send(
-      htmlPage(
-        "Configuration TOTP",
-        `
-          <p class="error">Code TOTP invalide. Réessaie.</p>
-          <a href="/security/setup-totp" class="btn btn-secondary">Réessayer</a>
-          <a href="/logout" class="btn btn-logout">Logout</a>
-        `
-      )
+    const params = stepupTotpClient.callbackParams(req);
+    const tokenSet = await stepupTotpClient.callback(
+      STEPUP_TOTP_REDIRECT_URI,
+      params
     );
+    const userinfo = await stepupTotpClient.userinfo(tokenSet.access_token);
+    const roles = extractRealmRoles(tokenSet.access_token);
+
+    req.session.user = { ...userinfo, roles };
+    req.session.stepupTokens = {
+      access_token: tokenSet.access_token,
+      refresh_token: tokenSet.refresh_token,
+      id_token: tokenSet.id_token,
+      expires_at: tokenSet.expires_at,
+    };
+    req.session.pendingStepup = null;
+    req.session.adaptiveAuth = {
+      ...(req.session.adaptiveAuth || {}),
+      decision: "STEP_UP_TOTP",
+      required_factor: "KEYCLOAK_TOTP",
+      auth_path: "KEYCLOAK_NATIVE_OTP",
+      policy_reason: "adaptive_keycloak_totp_verified",
+      completed: true,
+      completed_at: new Date().toISOString(),
+    };
+
+    return res.redirect("/");
+  } catch (e) {
+    console.error("[portal] callback-stepup-totp error:", e);
+    return res.status(500).send(`Step-up callback error: ${e?.message || "unknown"}`);
   }
-
-  setUserTotpRecord(req.session.user, {
-    base32: record.pending_base32,
-    verified: true,
-    enrolled_at: new Date().toISOString(),
-  });
-
-  return res.send(
-    htmlPage(
-      "TOTP configuré",
-      `
-        <p>Le second facteur TOTP est maintenant configuré avec succès.</p>
-        <a href="/" class="btn btn-success">Retour à l’accueil</a>
-        <a href="/logout" class="btn btn-logout">Logout</a>
-      `
-    )
-  );
 });
 
 app.get("/security/setup-face", async (req, res) => {
@@ -1169,15 +991,19 @@ app.get("/adaptive-stepup", async (req, res) => {
   }
 
   if (adaptive.decision === "STEP_UP_TOTP") {
-    const record = getUserTotpRecord(req.session.user);
-
-    if (!record?.base32 || record.verified !== true) {
-      return res.status(403).send(
-        renderTotpNotEnrolledPage(req.session.user, adaptive)
-      );
-    }
-
-    return res.send(renderTotpVerifyPage("", adaptive));
+    return res.send(
+      htmlPage(
+        "Redirection vers Keycloak OTP",
+        `
+          <p>Le niveau de risque est modéré. La vérification OTP native Keycloak est requise.</p>
+          <p><b>Policy reason:</b> ${adaptive.policy_reason || "n/a"}</p>
+          <p><b>Risk score:</b> ${adaptive.risk_score ?? "n/a"}</p>
+          <p class="small">Clique ci-dessous pour poursuivre la vérification OTP gérée par Keycloak.</p>
+          <a href="/login" class="btn btn-success">Recommencer le parcours</a>
+          <a href="/logout" class="btn btn-logout">Logout</a>
+        `
+      )
+    );
   }
 
   if (adaptive.decision === "STEP_UP_BIOMETRIC") {
@@ -1238,47 +1064,6 @@ app.get("/adaptive-stepup", async (req, res) => {
       `
     )
   );
-});
-
-app.post("/adaptive-totp-verify", (req, res) => {
-  if (!req.session.user) return res.redirect("/login");
-
-  const token = String(req.body.token || "").trim().replace(/\s+/g, "");
-  const record = getUserTotpRecord(req.session.user);
-
-  if (!record?.base32 || record.verified !== true) {
-    return res.status(403).send(
-      renderTotpNotEnrolledPage(req.session.user, req.session.adaptiveAuth || {})
-    );
-  }
-
-  const isValid = speakeasy.totp.verify({
-    secret: record.base32,
-    encoding: "base32",
-    token,
-    window: 1,
-  });
-
-  if (!isValid) {
-    return res.status(400).send(
-      renderTotpVerifyPage(
-        "Code TOTP invalide. Réessaie.",
-        req.session.adaptiveAuth || {}
-      )
-    );
-  }
-
-  req.session.adaptiveAuth = {
-    ...(req.session.adaptiveAuth || {}),
-    decision: "STEP_UP_TOTP",
-    required_factor: "TOTP_OR_WEBAUTHN",
-    auth_path: "SECOND_FACTOR",
-    policy_reason: "adaptive_totp_verified",
-    completed: true,
-    completed_at: new Date().toISOString(),
-  };
-
-  return res.redirect("/");
 });
 
 app.post("/adaptive-biometric-verify", async (req, res) => {
@@ -1432,7 +1217,8 @@ app.get("/protected", (req, res) => {
 });
 
 app.get("/logout", (req, res) => {
-  const idToken = req.session.tokens?.id_token;
+  const idToken =
+    req.session.stepupTokens?.id_token || req.session.tokens?.id_token;
 
   req.session.destroy((err) => {
     if (err) {
@@ -1445,7 +1231,9 @@ app.get("/logout", (req, res) => {
 
     const logoutUrl = `${KC_PUBLIC_URL}/realms/${KC_REALM}/protocol/openid-connect/logout`;
     const postRedirect = encodeURIComponent(`${APP_BASE_URL}/`);
-    const url = `${logoutUrl}?id_token_hint=${encodeURIComponent(idToken)}&post_logout_redirect_uri=${postRedirect}`;
+    const url = `${logoutUrl}?id_token_hint=${encodeURIComponent(
+      idToken
+    )}&post_logout_redirect_uri=${postRedirect}`;
 
     res.redirect(url);
   });
