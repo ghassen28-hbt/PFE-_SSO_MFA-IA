@@ -7,7 +7,7 @@ import re
 import math
 import requests
 import ipaddress
-from typing import Optional, Dict, Any
+from typing import Optional
 
 from user_agents import parse as parse_ua
 
@@ -264,6 +264,11 @@ def device_fingerprint(
 
 # ============================================================
 # FEATURES HISTORIQUES (depuis ClickHouse)
+# RÈGLE MÉTIER:
+# - LOGIN / LOGIN_ERROR = risque
+# - APP_SESSION_STARTED = audit uniquement
+# Toutes les features historiques de risque doivent donc se baser
+# uniquement sur les événements LOGIN et LOGIN_ERROR.
 # ============================================================
 
 def build_identity_filter(user_id: str, username: str) -> str:
@@ -357,7 +362,7 @@ def login_count_hours(
     SELECT count()
     FROM {TABLE}
     WHERE {identity_filter}
-      AND event_type IN ('LOGIN', 'APP_SESSION_STARTED')
+      AND event_type = 'LOGIN'
       AND event_success = 1
       AND event_time >= toDateTime('{since_str}')
       AND event_time <= toDateTime('{until_str}')
@@ -371,6 +376,8 @@ def is_new_device(user_id: str, username: str, fp: str):
     SELECT count()
     FROM {TABLE}
     WHERE {identity_filter}
+      AND event_type = 'LOGIN'
+      AND event_success = 1
       AND device_fp = '{sql_escape(fp)}'
     """
     return 1 if int(ch_query(sql).strip() or "0") == 0 else 0
@@ -384,6 +391,8 @@ def is_new_ip_for_user(user_id: str, username: str, ip: str):
     SELECT count()
     FROM {TABLE}
     WHERE {identity_filter}
+      AND event_type = 'LOGIN'
+      AND event_success = 1
       AND ip = '{sql_escape(ip)}'
     """
     return 1 if int(ch_query(sql).strip() or "0") == 0 else 0
@@ -403,7 +412,7 @@ def get_last_distinct_successful_location(
     SELECT ip, geo_latitude, geo_longitude, event_time
     FROM {TABLE}
     WHERE {identity_filter}
-      AND event_type IN ('LOGIN', 'APP_SESSION_STARTED')
+      AND event_type = 'LOGIN'
       AND event_success = 1
       AND geo_latitude != 0
       AND geo_longitude != 0
@@ -737,7 +746,7 @@ def build_event_context(data: dict, req: Request, event_type: str = "ASSESS"):
     is_impossible_travel = 0
 
     trusted_geo = (
-        event_type in ("LOGIN", "APP_SESSION_STARTED")
+        event_type == "LOGIN"
         and event_success == 1
         and ip
         and is_public_ip(ip)
@@ -758,7 +767,6 @@ def build_event_context(data: dict, req: Request, event_type: str = "ASSESS"):
 
     app_sens = app_sensitivity(client_id)
 
-    # IMPORTANT: garde cette liste strictement alignée avec le features.json du scoring-service
     scoring_features = {
         "client_id": client_id or "unknown",
         "app_sensitivity": app_sens,
@@ -976,7 +984,9 @@ async def receive_event(req: Request):
         raise HTTPException(status_code=400, detail="Invalid JSON payload")
 
     event_type = data.get("type", "") or "UNKNOWN"
-    tracked_for_scoring = {"LOGIN", "LOGIN_ERROR", "APP_SESSION_STARTED"}
+
+    # LOGIN et LOGIN_ERROR uniquement pour le risque
+    tracked_for_scoring = {"LOGIN", "LOGIN_ERROR"}
 
     context = build_event_context(data, req, event_type=event_type)
 
@@ -986,6 +996,12 @@ async def receive_event(req: Request):
     else:
         row = row_from_context(context, None)
         scoring_result = {
+            "risk_score": None,
+            "risk_label": "not_applicable",
+            "decision": "NOT_SCORED",
+            "required_factor": "NONE",
+            "auth_path": "NONE",
+            "policy_reason": "audit_only_event",
             "scoring_status": "skipped",
         }
 

@@ -17,13 +17,14 @@ app.use(
   })
 );
 
-app.set("trust proxy", 1);
+app.set("trust proxy", true);
+
+const CH_HEADER_VALUE =
+  "Sec-CH-UA, Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Full-Version-List";
 
 app.use((req, res, next) => {
-  const ch =
-    "Sec-CH-UA, Sec-CH-UA-Platform, Sec-CH-UA-Platform-Version, Sec-CH-UA-Full-Version-List";
-  res.setHeader("Accept-CH", ch);
-  res.setHeader("Critical-CH", ch);
+  res.setHeader("Accept-CH", CH_HEADER_VALUE);
+  res.setHeader("Critical-CH", CH_HEADER_VALUE);
   res.setHeader(
     "Permissions-Policy",
     'ch-ua=(self), ch-ua-platform=(self), ch-ua-platform-version=(self), ch-ua-full-version-list=(self)'
@@ -76,6 +77,8 @@ const APP_BASE_URL = (
 const REDIRECT_URI = `${APP_BASE_URL}/callback`;
 const STEPUP_TOTP_REDIRECT_URI = `${APP_BASE_URL}/callback-stepup-totp`;
 
+const IS_HTTPS_APP = APP_BASE_URL.startsWith("https://");
+
 if (!CLIENT_SECRET) {
   console.error("[portal] PORTAL_CLIENT_SECRET missing in .env");
   process.exit(1);
@@ -93,7 +96,7 @@ app.use(
     saveUninitialized: false,
     cookie: {
       httpOnly: true,
-      secure: false,
+      secure: IS_HTTPS_APP,
       sameSite: "lax",
     },
   })
@@ -130,7 +133,8 @@ async function buildClient({
   clientSecret,
   redirectUri,
 }) {
-  const issuer = await Issuer.discover(`${kcBaseUrl}/realms/${realm}`);
+  const discoveryUrl = `${kcBaseUrl}/realms/${realm}/.well-known/openid-configuration`;
+  const issuer = await Issuer.discover(discoveryUrl);
 
   const oidcClient = new issuer.Client({
     client_id: clientId,
@@ -146,13 +150,20 @@ async function buildClient({
   };
 }
 
+function normalizeIp(raw) {
+  if (!raw) return "";
+  const ip = String(raw).split(",")[0].trim();
+  if (ip.startsWith("::ffff:")) return ip.slice(7);
+  return ip;
+}
+
 function getClientIp(req) {
   return (
-    req.headers["cf-connecting-ip"] ||
-    req.headers["x-forwarded-for"]?.split(",")[0].trim() ||
-    req.headers["x-real-ip"] ||
-    req.ip ||
-    req.socket?.remoteAddress ||
+    normalizeIp(req.headers["cf-connecting-ip"]) ||
+    normalizeIp(req.headers["x-forwarded-for"]) ||
+    normalizeIp(req.headers["x-real-ip"]) ||
+    normalizeIp(req.ip) ||
+    normalizeIp(req.socket?.remoteAddress) ||
     ""
   );
 }
@@ -166,6 +177,30 @@ function getClientHints(req) {
     http_sec_ch_ua_full_version_list:
       req.headers["sec-ch-ua-full-version-list"] || "",
     http_accept_language: req.headers["accept-language"] || "",
+  };
+}
+
+function buildCommonSecurityContext(req, userinfo) {
+  const ip = getClientIp(req);
+  const ua = req.headers["user-agent"] || "";
+  const ch = getClientHints(req);
+
+  return {
+    realm: KC_REALM,
+    clientId: CLIENT_ID,
+    userId: userinfo.sub,
+    details: {
+      username: userinfo.preferred_username || userinfo.email || "",
+    },
+    ipAddress: ip,
+    http_x_forwarded_for: ip,
+    http_x_real_ip: ip,
+    http_user_agent: ua,
+    http_sec_ch_ua: ch.http_sec_ch_ua,
+    http_sec_ch_ua_platform: ch.http_sec_ch_ua_platform,
+    http_sec_ch_ua_platform_version: ch.http_sec_ch_ua_platform_version,
+    http_sec_ch_ua_full_version_list: ch.http_sec_ch_ua_full_version_list,
+    http_accept_language: ch.http_accept_language,
   };
 }
 
@@ -472,34 +507,19 @@ app.get("/login", (req, res) => {
   );
 });
 
-
-
-async function sendAppSessionStartedEvent({ userinfo, ip, ua, ch, sessionId }) {
+async function sendAppSessionStartedEvent({ userinfo, req, sessionId }) {
   const payload = {
     type: "APP_SESSION_STARTED",
-    realm: KC_REALM,
-    clientId: CLIENT_ID,
-    userId: userinfo.sub,
-    error: "",
-    details: {
-      username: userinfo.preferred_username || userinfo.email || "",
-    },
-    ipAddress: ip,
-    http_x_forwarded_for: ip,
-    http_user_agent: ua,
+    ...buildCommonSecurityContext(req, userinfo),
     sessionId,
-    http_sec_ch_ua: ch.http_sec_ch_ua,
-    http_sec_ch_ua_platform: ch.http_sec_ch_ua_platform,
-    http_sec_ch_ua_platform_version: ch.http_sec_ch_ua_platform_version,
-    http_sec_ch_ua_full_version_list: ch.http_sec_ch_ua_full_version_list,
-    http_accept_language: ch.http_accept_language,
   };
 
   const eventRes = await fetch(EVENT_COLLECTOR_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-forwarded-for": ip,
+      "x-forwarded-for": payload.ipAddress,
+      "x-real-ip": payload.ipAddress,
     },
     body: JSON.stringify(payload),
   });
@@ -514,29 +534,15 @@ async function sendAppSessionStartedEvent({ userinfo, ip, ua, ch, sessionId }) {
   return await eventRes.json().catch(() => ({}));
 }
 
-async function assessAdaptiveRisk({ userinfo, ip, ua, ch }) {
-  const payload = {
-    realm: KC_REALM,
-    clientId: CLIENT_ID,
-    userId: userinfo.sub,
-    details: {
-      username: userinfo.preferred_username || userinfo.email || "",
-    },
-    ipAddress: ip,
-    http_x_forwarded_for: ip,
-    http_user_agent: ua,
-    http_sec_ch_ua: ch.http_sec_ch_ua,
-    http_sec_ch_ua_platform: ch.http_sec_ch_ua_platform,
-    http_sec_ch_ua_platform_version: ch.http_sec_ch_ua_platform_version,
-    http_sec_ch_ua_full_version_list: ch.http_sec_ch_ua_full_version_list,
-    http_accept_language: ch.http_accept_language,
-  };
+async function assessAdaptiveRisk({ userinfo, req }) {
+  const payload = buildCommonSecurityContext(req, userinfo);
 
   const assessRes = await fetch(ASSESS_URL, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-forwarded-for": ip,
+      "x-forwarded-for": payload.ipAddress,
+      "x-real-ip": payload.ipAddress,
     },
     body: JSON.stringify(payload),
   });
@@ -755,9 +761,6 @@ app.get("/callback", async (req, res) => {
     const userinfo = await portalClient.userinfo(tokenSet.access_token);
 
     const roles = extractRealmRoles(tokenSet.access_token);
-    const ip = getClientIp(req);
-    const ua = req.headers["user-agent"] || "";
-    const ch = getClientHints(req);
 
     let adaptiveDecision = {
       risk_score: null,
@@ -770,7 +773,7 @@ app.get("/callback", async (req, res) => {
     };
 
     try {
-      const assess = await assessAdaptiveRisk({ userinfo, ip, ua, ch });
+      const assess = await assessAdaptiveRisk({ userinfo, req });
 
       adaptiveDecision = {
         risk_score: assess.risk_score ?? null,
@@ -799,9 +802,7 @@ app.get("/callback", async (req, res) => {
     try {
       await sendAppSessionStartedEvent({
         userinfo,
-        ip,
-        ua,
-        ch,
+        req,
         sessionId: req.sessionID,
       });
     } catch (e) {

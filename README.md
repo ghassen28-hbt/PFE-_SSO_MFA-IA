@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # SSO + MFA + IA — Système d'Authentification Adaptative
 
 > Projet de Fin d'Études — Architecture microservices avec Keycloak, OIDC, MFA et scoring IA (LightGBM)
@@ -142,3 +143,6 @@ Projet académique — Usage interne PFE uniquement.
 - URL: http://localhost:8081
 - Admin user: admin
 - Admin password: admin
+=======
+# PFE_SSO
+>>>>>>> 82530584ab174d3a61574cdbeb0bff9c89e401ae
