@@ -42,6 +42,8 @@ TABLE = os.getenv("CLICKHOUSE_TABLE", "login_events")
 SCORING_ENABLED = os.getenv("SCORING_ENABLED", "true").lower() == "true"
 SCORING_URL = os.getenv("SCORING_URL", "http://host.docker.internal:8090/score")
 SCORING_TIMEOUT = int(os.getenv("SCORING_TIMEOUT", "5"))
+RECENT_LOGIN_LOOKBACK_MINUTES = int(os.getenv("RECENT_LOGIN_LOOKBACK_MINUTES", "3"))
+HISTORY_RESET_AT_RAW = os.getenv("HISTORY_RESET_AT", "").strip()
 
 _http = requests.Session()
 
@@ -73,6 +75,48 @@ def sql_escape(value: str) -> str:
 
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def parse_config_datetime(raw: str) -> Optional[datetime]:
+    if not raw:
+        return None
+
+    raw_str = str(raw).strip()
+    if not raw_str:
+        return None
+
+    candidates = [raw_str]
+    if " " in raw_str and "T" not in raw_str:
+        candidates.append(raw_str.replace(" ", "T"))
+
+    for candidate in candidates:
+        try:
+            dt = datetime.fromisoformat(candidate.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(timezone.utc)
+        except Exception:
+            continue
+
+    return None
+
+
+HISTORY_RESET_AT = parse_config_datetime(HISTORY_RESET_AT_RAW)
+
+
+def apply_history_reset_floor(
+    since: Optional[datetime] = None,
+    until: Optional[datetime] = None,
+):
+    if HISTORY_RESET_AT is None:
+        return since, until
+
+    floored_since = max(filter(None, [since, HISTORY_RESET_AT])) if since is not None else HISTORY_RESET_AT
+
+    if until is not None and floored_since > until:
+        floored_since = until
+
+    return floored_since, until
 
 
 def parse_event_time(data: dict) -> datetime:
@@ -164,6 +208,19 @@ def is_public_ip(ip: str) -> bool:
         return addr.is_global
     except ValueError:
         return False
+
+
+def extract_username(data: dict) -> str:
+    details = data.get("details") or {}
+    return (
+        details.get("username")
+        or details.get("preferred_username")
+        or details.get("auth_username")
+        or details.get("attempted_username")
+        or details.get("login_username")
+        or data.get("username")
+        or ""
+    ).strip()
 
 
 # ============================================================
@@ -307,6 +364,7 @@ def count_login_errors_minutes(
 ):
     base_time = ref_time or now_utc()
     since = base_time - timedelta(minutes=window_minutes)
+    since, _ = apply_history_reset_floor(since=since, until=base_time)
     since_str = since.strftime("%Y-%m-%d %H:%M:%S")
     until_str = base_time.strftime("%Y-%m-%d %H:%M:%S")
     match_filter = build_failure_filter(user_id, username, ip)
@@ -331,6 +389,7 @@ def count_login_errors_hours(
 ):
     base_time = ref_time or now_utc()
     since = base_time - timedelta(hours=hours)
+    since, _ = apply_history_reset_floor(since=since, until=base_time)
     since_str = since.strftime("%Y-%m-%d %H:%M:%S")
     until_str = base_time.strftime("%Y-%m-%d %H:%M:%S")
     match_filter = build_failure_filter(user_id, username, ip)
@@ -354,6 +413,7 @@ def login_count_hours(
 ):
     base_time = ref_time or now_utc()
     since = base_time - timedelta(hours=hours)
+    since, _ = apply_history_reset_floor(since=since, until=base_time)
     since_str = since.strftime("%Y-%m-%d %H:%M:%S")
     until_str = base_time.strftime("%Y-%m-%d %H:%M:%S")
     identity_filter = build_identity_filter(user_id, username)
@@ -370,8 +430,115 @@ def login_count_hours(
     return int(ch_query(sql).strip() or "0")
 
 
+def successful_login_count(
+    user_id: str = "",
+    username: str = "",
+    ref_time: Optional[datetime] = None,
+):
+    identity_filter = build_identity_filter(user_id, username)
+    if identity_filter == "1 = 0":
+        return 0
+
+    clauses = [
+        identity_filter,
+        "event_type = 'LOGIN'",
+        "event_success = 1",
+    ]
+
+    if HISTORY_RESET_AT is not None:
+        reset_str = HISTORY_RESET_AT.strftime("%Y-%m-%d %H:%M:%S")
+        clauses.append(f"event_time >= toDateTime('{reset_str}')")
+
+    if ref_time is not None:
+        until_str = ref_time.strftime("%Y-%m-%d %H:%M:%S")
+        clauses.append(f"event_time <= toDateTime('{until_str}')")
+
+    sql = f"""
+    SELECT count()
+    FROM {TABLE}
+    WHERE {" AND ".join(clauses)}
+    """
+    return int(ch_query(sql).strip() or "0")
+
+
+def normalize_risk_score_value(raw_score) -> Optional[float]:
+    if raw_score in (None, "", "\\N"):
+        return None
+
+    try:
+        score_value = float(raw_score)
+    except Exception:
+        return None
+
+    if score_value > 1.0:
+        score_value /= 100.0
+
+    return round(max(0.0, min(1.0, score_value)), 4)
+
+
+def get_recent_login_scoring(
+    user_id: str = "",
+    username: str = "",
+    client_id: str = "",
+    ip: str = "",
+    ref_time: Optional[datetime] = None,
+    lookback_minutes: int = RECENT_LOGIN_LOOKBACK_MINUTES,
+):
+    identity_filter = build_identity_filter(user_id, username)
+    if identity_filter == "1 = 0":
+        return None
+
+    base_time = ref_time or now_utc()
+    since = base_time - timedelta(minutes=max(1, lookback_minutes))
+    since, _ = apply_history_reset_floor(since=since, until=base_time)
+    since_str = since.strftime("%Y-%m-%d %H:%M:%S")
+    until_str = base_time.strftime("%Y-%m-%d %H:%M:%S")
+
+    clauses = [
+        identity_filter,
+        "event_type = 'LOGIN'",
+        "event_success = 1",
+        f"event_time >= toDateTime('{since_str}')",
+        f"event_time <= toDateTime('{until_str}')",
+    ]
+
+    if client_id:
+        clauses.append(f"client_id = '{sql_escape(client_id)}'")
+    if ip:
+        clauses.append(f"ip = '{sql_escape(ip)}'")
+
+    sql = f"""
+    SELECT risk_score, risk_label, decision, required_factor, auth_path, policy_reason
+    FROM {TABLE}
+    WHERE {" AND ".join(clauses)}
+    ORDER BY event_time DESC
+    LIMIT 1
+    """
+
+    result = ch_query(sql).strip()
+    if not result:
+        return None
+
+    parts = result.split("\t")
+    if len(parts) != 6:
+        return None
+
+    return {
+        "risk_score": normalize_risk_score_value(parts[0]),
+        "risk_label": parts[1] or "unknown",
+        "decision": parts[2] or "ALLOW",
+        "required_factor": parts[3] or "NONE",
+        "auth_path": parts[4] or "SSO_ONLY",
+        "policy_reason": parts[5] or "unknown_policy_reason",
+    }
+
+
 def is_new_device(user_id: str, username: str, fp: str):
     identity_filter = build_identity_filter(user_id, username)
+    time_filter = ""
+    if HISTORY_RESET_AT is not None:
+        reset_str = HISTORY_RESET_AT.strftime("%Y-%m-%d %H:%M:%S")
+        time_filter = f"\n      AND event_time >= toDateTime('{reset_str}')"
     sql = f"""
     SELECT count()
     FROM {TABLE}
@@ -379,6 +546,7 @@ def is_new_device(user_id: str, username: str, fp: str):
       AND event_type = 'LOGIN'
       AND event_success = 1
       AND device_fp = '{sql_escape(fp)}'
+      {time_filter}
     """
     return 1 if int(ch_query(sql).strip() or "0") == 0 else 0
 
@@ -387,6 +555,10 @@ def is_new_ip_for_user(user_id: str, username: str, ip: str):
     if not ip:
         return 0
     identity_filter = build_identity_filter(user_id, username)
+    time_filter = ""
+    if HISTORY_RESET_AT is not None:
+        reset_str = HISTORY_RESET_AT.strftime("%Y-%m-%d %H:%M:%S")
+        time_filter = f"\n      AND event_time >= toDateTime('{reset_str}')"
     sql = f"""
     SELECT count()
     FROM {TABLE}
@@ -394,6 +566,7 @@ def is_new_ip_for_user(user_id: str, username: str, ip: str):
       AND event_type = 'LOGIN'
       AND event_success = 1
       AND ip = '{sql_escape(ip)}'
+      {time_filter}
     """
     return 1 if int(ch_query(sql).strip() or "0") == 0 else 0
 
@@ -416,6 +589,7 @@ def get_last_distinct_successful_location(
       AND event_success = 1
       AND geo_latitude != 0
       AND geo_longitude != 0
+      {"AND event_time >= toDateTime('" + HISTORY_RESET_AT.strftime("%Y-%m-%d %H:%M:%S") + "')" if HISTORY_RESET_AT is not None else ""}
     ORDER BY event_time DESC
     LIMIT 10
     """
@@ -593,8 +767,9 @@ def score_event(features: dict) -> dict:
         )
         response.raise_for_status()
         payload = response.json()
+        normalized_score = normalize_risk_score_value(payload.get("risk_score"))
         return {
-            "risk_score": payload.get("risk_score"),
+            "risk_score": normalized_score,
             "risk_label": payload.get("risk_label", "unknown"),
             "decision": payload.get("decision", "ALLOW"),
             "required_factor": payload.get("required_factor", "NONE"),
@@ -636,15 +811,7 @@ def build_event_context(data: dict, req: Request, event_type: str = "ASSESS"):
     error = data.get("error", "")
     details = data.get("details") or {}
 
-    username = (
-        details.get("username")
-        or details.get("preferred_username")
-        or details.get("auth_username")
-        or details.get("attempted_username")
-        or details.get("login_username")
-        or data.get("username")
-        or ""
-    )
+    username = extract_username(data)
 
     ip = extract_real_ip(data, req)
 
@@ -693,11 +860,22 @@ def build_event_context(data: dict, req: Request, event_type: str = "ASSESS"):
     login_1h = 0
     new_dev = 0
     new_ip = 0
+    prior_successful_logins = 0
 
     if identity_available:
+        prior_successful_logins = successful_login_count(
+            user_id=user_id,
+            username=username,
+            ref_time=event_time,
+        )
         login_1h = login_count_hours(1, user_id=user_id, username=username, ref_time=event_time)
-        new_dev = is_new_device(user_id, username, fp)
-        new_ip = is_new_ip_for_user(user_id, username, ip)
+
+        if prior_successful_logins > 0:
+            new_dev = is_new_device(user_id, username, fp)
+            new_ip = is_new_ip_for_user(user_id, username, ip)
+
+        if event_type == "LOGIN" and event_success == 1:
+            login_1h += 1
 
     ip_data = enrich_ip(ip)
     abuse = ip_data.get("abuseipdb", {}) or {}
@@ -956,7 +1134,21 @@ async def check_password(req: Request):
 async def assess_event(req: Request):
     data = await req.json()
     context = build_event_context(data, req, event_type="ASSESS")
-    scoring_result = score_event(context["scoring_features"])
+    scoring_result = get_recent_login_scoring(
+        user_id=context["user_id"],
+        username=context["username"],
+        client_id=context["client_id"],
+        ip=context["ip"],
+        ref_time=context["event_time"],
+    )
+
+    if scoring_result:
+        scoring_result = {
+            **scoring_result,
+            "scoring_status": "reused_recent_login",
+        }
+    else:
+        scoring_result = score_event(context["scoring_features"])
 
     return {
         "status": "ok",
@@ -993,6 +1185,32 @@ async def receive_event(req: Request):
     if event_type in tracked_for_scoring:
         scoring_result = score_event(context["scoring_features"])
         row = row_from_context(context, scoring_result)
+    elif event_type == "APP_SESSION_STARTED":
+        scoring_result = get_recent_login_scoring(
+            user_id=context["user_id"],
+            username=context["username"],
+            client_id=context["client_id"],
+            ip=context["ip"],
+            ref_time=context["event_time"],
+        )
+
+        if scoring_result:
+            scoring_result = {
+                **scoring_result,
+                "scoring_status": "inherited_recent_login",
+            }
+            row = row_from_context(context, scoring_result)
+        else:
+            row = row_from_context(context, None)
+            scoring_result = {
+                "risk_score": None,
+                "risk_label": "not_applicable",
+                "decision": "NOT_SCORED",
+                "required_factor": "NONE",
+                "auth_path": "NONE",
+                "policy_reason": "app_session_without_recent_login",
+                "scoring_status": "skipped",
+            }
     else:
         row = row_from_context(context, None)
         scoring_result = {

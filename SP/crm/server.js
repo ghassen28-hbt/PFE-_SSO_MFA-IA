@@ -46,6 +46,14 @@ const CHECK_PASSWORD_URL = (
 
 const APP_BASE_URL = (process.env.CRM_BASE_URL || "http://localhost:4002").trim();
 const REDIRECT_URI = `${APP_BASE_URL}/callback`;
+const SESSION_COOKIE_NAME =
+  process.env.CRM_SESSION_COOKIE_NAME || "pfe_crm_sid";
+const SESSION_COOKIE_OPTIONS = {
+  path: "/",
+  httpOnly: true,
+  secure: false,
+  sameSite: "lax",
+};
 
 if (!CLIENT_SECRET) {
   console.error("CRM_CLIENT_SECRET missing in .env");
@@ -54,14 +62,11 @@ if (!CLIENT_SECRET) {
 
 app.use(
   session({
+    name: SESSION_COOKIE_NAME,
     secret: process.env.SESSION_SECRET || "change_me",
     resave: false,
     saveUninitialized: false,
-    cookie: {
-      httpOnly: true,
-      secure: false,
-      sameSite: "lax",
-    },
+    cookie: SESSION_COOKIE_OPTIONS,
   })
 );
 
@@ -89,6 +94,49 @@ function getClientHints(req) {
       req.headers["sec-ch-ua-full-version-list"] || "",
     http_accept_language: req.headers["accept-language"] || "",
   };
+}
+
+function normalizeRiskScore(rawScore) {
+  if (rawScore == null || rawScore === "") return null;
+  const score = Number(rawScore);
+  if (!Number.isFinite(score)) return null;
+  const normalized = score > 1 ? score / 100 : score;
+  return Number(normalized.toFixed(4));
+}
+
+function formatRiskScore(rawScore) {
+  const normalized = normalizeRiskScore(rawScore);
+  return normalized == null ? "n/a" : normalized.toFixed(4);
+}
+
+function buildFreshLoginUrl(oidcClient, extraParams = {}) {
+  return oidcClient.authorizationUrl({
+    scope: "openid profile email",
+    prompt: "login",
+    max_age: 0,
+    ...extraParams,
+  });
+}
+
+function redirectToFreshLogin(req, res, oidcClient, extraParams = {}) {
+  const loginUrl = buildFreshLoginUrl(oidcClient, extraParams);
+
+  const finishRedirect = () => {
+    res.clearCookie(SESSION_COOKIE_NAME, SESSION_COOKIE_OPTIONS);
+    res.redirect(loginUrl);
+  };
+
+  if (!req.session) {
+    finishRedirect();
+    return;
+  }
+
+  req.session.destroy((err) => {
+    if (err) {
+      console.error("[crm] Session destroy before login error:", err);
+    }
+    finishRedirect();
+  });
 }
 
 function htmlPage(title, content) {
@@ -287,7 +335,7 @@ app.get("/", (req, res) => {
       <p><b>Decision:</b> ${adaptive.decision}</p>
       <p><b>Required factor:</b> ${adaptive.required_factor || "NONE"}</p>
       <p><b>Auth path:</b> ${adaptive.auth_path || "SSO_ONLY"}</p>
-      <p><b>Risk score:</b> ${adaptive.risk_score ?? "n/a"}</p>
+      <p><b>Risk score:</b> ${formatRiskScore(adaptive.risk_score)}</p>
       <p><b>Adaptive auth completed:</b> ${adaptive.completed ? "yes" : "no"}</p>
     `
     : `<p><b>Adaptive auth:</b> not evaluated</p>`;
@@ -308,12 +356,7 @@ app.get("/", (req, res) => {
 
 app.get("/login", (req, res) => {
   if (!client) return res.status(503).send("OIDC client not ready, retry.");
-
-  res.redirect(
-    client.authorizationUrl({
-      scope: "openid profile email",
-    })
-  );
+  redirectToFreshLogin(req, res, client);
 });
 
 async function sendLoginEvent({
@@ -432,7 +475,7 @@ app.get("/callback", async (req, res) => {
       const assess = await assessAdaptiveRisk({ userinfo, ip, ua, ch });
 
       adaptiveDecision = {
-        risk_score: assess.risk_score ?? null,
+        risk_score: normalizeRiskScore(assess.risk_score),
         risk_label: assess.risk_label || "unknown",
         decision: assess.decision || "ALLOW",
         required_factor: assess.required_factor || "NONE",
@@ -520,7 +563,7 @@ app.get("/adaptive-stepup", (req, res) => {
     <p><b>Utilisateur:</b> ${username}</p>
     <p><b>Risk label:</b> ${adaptive.risk_label || "unknown"}</p>
     <p><b>Required factor:</b> ${adaptive.required_factor || "UNKNOWN"}</p>
-    <p><b>Risk score:</b> ${adaptive.risk_score ?? "n/a"}</p>
+    <p><b>Risk score:</b> ${formatRiskScore(adaptive.risk_score)}</p>
     <p class="small">Cette page représente la passerelle MFA adaptative. Dans la suite du projet, elle sera reliée au vrai facteur demandé.</p>
   `;
 
@@ -580,7 +623,7 @@ app.get("/adaptive-blocked", (req, res) => {
       <div class="badge">${adaptive.decision || "BLOCK_REVIEW"}</div>
       <p><b>Risk label:</b> ${adaptive.risk_label || "critical"}</p>
       <p><b>Required factor:</b> ${adaptive.required_factor || "ADMIN_REVIEW"}</p>
-      <p><b>Risk score:</b> ${adaptive.risk_score ?? "n/a"}</p>
+      <p><b>Risk score:</b> ${formatRiskScore(adaptive.risk_score)}</p>
       <p class="small">Dans la version finale, cette étape pourra être reliée à une validation administrative ou à une politique de sécurité plus stricte.</p>
     `,
     `<a href="/logout" class="btn btn-logout">Logout</a>`
@@ -610,13 +653,15 @@ app.get("/logout", (req, res) => {
   const idToken = req.session.tokens?.id_token;
 
   req.session.destroy(() => {
+    res.clearCookie(SESSION_COOKIE_NAME, SESSION_COOKIE_OPTIONS);
     const redirect = encodeURIComponent(`${APP_BASE_URL}/`);
     if (!idToken) return res.redirect(`${APP_BASE_URL}/`);
 
     const url =
       `${KC_PUBLIC_URL}/realms/${KC_REALM}/protocol/openid-connect/logout` +
       `?id_token_hint=${encodeURIComponent(idToken)}` +
-      `&post_logout_redirect_uri=${redirect}`;
+      `&post_logout_redirect_uri=${redirect}` +
+      `&client_id=${encodeURIComponent(CLIENT_ID)}`;
 
     res.redirect(url);
   });

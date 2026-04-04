@@ -14,6 +14,14 @@ const KC_REALM = process.env.KC_REALM || "PFE-SSO";
 const CLIENT_ID = process.env.HR_CLIENT_ID || "hr-client-4";
 const CLIENT_SECRET = process.env.HR_CLIENT_SECRET;
 const REDIRECT_URI = `http://localhost:${PORT}/callback`;
+const SESSION_COOKIE_NAME =
+  process.env.HR_SESSION_COOKIE_NAME || "pfe_hr_sid";
+const SESSION_COOKIE_OPTIONS = {
+  path: "/",
+  httpOnly: true,
+  secure: false,
+  sameSite: "lax",
+};
 // event-collector (FastAPI) attendu: POST /events
 const EVENT_COLLECTOR_URL = (process.env.EVENT_COLLECTOR_URL || "http://localhost:8088/events").trim();
 
@@ -24,14 +32,46 @@ if (!CLIENT_SECRET) {
 
 app.use(
   session({
+    name: SESSION_COOKIE_NAME,
     secret: process.env.SESSION_SECRET || "change_me",
     resave: false,
     saveUninitialized: false,
+    cookie: SESSION_COOKIE_OPTIONS,
   })
 );
 
 let client;
 let issuerUrl;
+
+function buildFreshLoginUrl(oidcClient, extraParams = {}) {
+  return oidcClient.authorizationUrl({
+    scope: "openid profile email",
+    prompt: "login",
+    max_age: 0,
+    ...extraParams,
+  });
+}
+
+function redirectToFreshLogin(req, res, oidcClient, extraParams = {}) {
+  const loginUrl = buildFreshLoginUrl(oidcClient, extraParams);
+
+  const finishRedirect = () => {
+    res.clearCookie(SESSION_COOKIE_NAME, SESSION_COOKIE_OPTIONS);
+    res.redirect(loginUrl);
+  };
+
+  if (!req.session) {
+    finishRedirect();
+    return;
+  }
+
+  req.session.destroy((err) => {
+    if (err) {
+      console.error("[hr] Session destroy before login error:", err);
+    }
+    finishRedirect();
+  });
+}
 
 (async () => {
   const built = await buildClient({
@@ -170,7 +210,7 @@ app.get("/", (req, res) => {
 
 app.get("/login", (req, res) => {
   if (!client) return res.status(503).send("OIDC client not ready, retry.");
-  res.redirect(client.authorizationUrl({ scope: "openid profile email" }));
+  redirectToFreshLogin(req, res, client);
 });
 
 app.get("/callback", async (req, res) => {
@@ -256,13 +296,15 @@ app.get("/logout", (req, res) => {
   const idToken = req.session.tokens?.id_token;
 
   req.session.destroy(() => {
+    res.clearCookie(SESSION_COOKIE_NAME, SESSION_COOKIE_OPTIONS);
     const redirect = encodeURIComponent(`http://localhost:${PORT}/`);
     if (!idToken) return res.redirect(`http://localhost:${PORT}/`);
 
     const url =
       `${issuerUrl}/protocol/openid-connect/logout` +
       `?id_token_hint=${encodeURIComponent(idToken)}` +
-      `&post_logout_redirect_uri=${redirect}`;
+      `&post_logout_redirect_uri=${redirect}` +
+      `&client_id=${encodeURIComponent(CLIENT_ID)}`;
 
     res.redirect(url);
   });

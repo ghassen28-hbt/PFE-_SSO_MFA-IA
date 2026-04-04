@@ -60,6 +60,11 @@ public class RiskEventListenerProvider implements EventListenerProvider {
             String userAgent = "";
             String xForwardedFor = "";
             String xRealIp = "";
+            String secChUa = "";
+            String secChUaPlatform = "";
+            String secChUaPlatformVersion = "";
+            String secChUaFullVersionList = "";
+            String acceptLanguage = "";
 
             try {
                 if (session != null
@@ -81,6 +86,31 @@ public class RiskEventListenerProvider implements EventListenerProvider {
                             .getHttpRequest()
                             .getHttpHeaders()
                             .getHeaderString("X-Real-IP"));
+
+                    secChUa = safe(session.getContext()
+                            .getHttpRequest()
+                            .getHttpHeaders()
+                            .getHeaderString("Sec-CH-UA"));
+
+                    secChUaPlatform = safe(session.getContext()
+                            .getHttpRequest()
+                            .getHttpHeaders()
+                            .getHeaderString("Sec-CH-UA-Platform"));
+
+                    secChUaPlatformVersion = safe(session.getContext()
+                            .getHttpRequest()
+                            .getHttpHeaders()
+                            .getHeaderString("Sec-CH-UA-Platform-Version"));
+
+                    secChUaFullVersionList = safe(session.getContext()
+                            .getHttpRequest()
+                            .getHttpHeaders()
+                            .getHeaderString("Sec-CH-UA-Full-Version-List"));
+
+                    acceptLanguage = safe(session.getContext()
+                            .getHttpRequest()
+                            .getHttpHeaders()
+                            .getHeaderString("Accept-Language"));
                 }
             } catch (Exception ignored) {
             }
@@ -111,6 +141,11 @@ public class RiskEventListenerProvider implements EventListenerProvider {
             payload.put("error", safe(event.getError()));
             payload.put("details", event.getDetails() != null ? event.getDetails() : Map.of());
             payload.put("http_user_agent", userAgent);
+            payload.put("http_sec_ch_ua", secChUa);
+            payload.put("http_sec_ch_ua_platform", secChUaPlatform);
+            payload.put("http_sec_ch_ua_platform_version", secChUaPlatformVersion);
+            payload.put("http_sec_ch_ua_full_version_list", secChUaFullVersionList);
+            payload.put("http_accept_language", acceptLanguage);
 
             System.out.println("[RiskListener] DEBUG event.getIpAddress() = " + eventIp);
             System.out.println("[RiskListener] DEBUG X-Forwarded-For = " + xForwardedFor);

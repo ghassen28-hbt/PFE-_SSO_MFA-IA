@@ -98,7 +98,7 @@ services:
       KEYCLOAK_ADMIN: admin
       KEYCLOAK_ADMIN_PASSWORD: admin
       KC_HTTP_ENABLED: "true"
-      KC_HOSTNAME: "https://advise-headline-marcus-folder.trycloudflare.com"
+      KC_HOSTNAME: "https://lowest-cooking-pas-swing.trycloudflare.com"
       KC_HOSTNAME_STRICT: "false"
       KC_PROXY_HEADERS: "xforwarded"
       KC_SPI_EVENTS_LISTENER_RISK_EVENT_LISTENER_COLLECTOR_URL: "http://event-collector:8088/events"

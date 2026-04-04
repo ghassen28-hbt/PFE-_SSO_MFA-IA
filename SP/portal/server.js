@@ -78,6 +78,14 @@ const REDIRECT_URI = `${APP_BASE_URL}/callback`;
 const STEPUP_TOTP_REDIRECT_URI = `${APP_BASE_URL}/callback-stepup-totp`;
 
 const IS_HTTPS_APP = APP_BASE_URL.startsWith("https://");
+const SESSION_COOKIE_NAME =
+  process.env.PORTAL_SESSION_COOKIE_NAME || "pfe_portal_sid";
+const SESSION_COOKIE_OPTIONS = {
+  path: "/",
+  httpOnly: true,
+  secure: IS_HTTPS_APP,
+  sameSite: "lax",
+};
 
 if (!CLIENT_SECRET) {
   console.error("[portal] PORTAL_CLIENT_SECRET missing in .env");
@@ -91,14 +99,11 @@ if (!STEPUP_TOTP_CLIENT_SECRET) {
 
 app.use(
   session({
+    name: SESSION_COOKIE_NAME,
     secret: process.env.SESSION_SECRET || "change_me",
     resave: false,
     saveUninitialized: false,
-    cookie: {
-      httpOnly: true,
-      secure: IS_HTTPS_APP,
-      sameSite: "lax",
-    },
+    cookie: SESSION_COOKIE_OPTIONS,
   })
 );
 
@@ -124,6 +129,49 @@ function extractRealmRoles(accessToken) {
   const payload = decodeJwtPayload(accessToken);
   const roles = payload?.realm_access?.roles;
   return Array.isArray(roles) ? roles : [];
+}
+
+function normalizeRiskScore(rawScore) {
+  if (rawScore == null || rawScore === "") return null;
+  const score = Number(rawScore);
+  if (!Number.isFinite(score)) return null;
+  const normalized = score > 1 ? score / 100 : score;
+  return Number(normalized.toFixed(4));
+}
+
+function formatRiskScore(rawScore) {
+  const normalized = normalizeRiskScore(rawScore);
+  return normalized == null ? "n/a" : normalized.toFixed(4);
+}
+
+function buildFreshLoginUrl(oidcClient, extraParams = {}) {
+  return oidcClient.authorizationUrl({
+    scope: "openid profile email",
+    prompt: "login",
+    max_age: 0,
+    ...extraParams,
+  });
+}
+
+function redirectToFreshLogin(req, res, oidcClient, extraParams = {}) {
+  const loginUrl = buildFreshLoginUrl(oidcClient, extraParams);
+
+  const finishRedirect = () => {
+    res.clearCookie(SESSION_COOKIE_NAME, SESSION_COOKIE_OPTIONS);
+    res.redirect(loginUrl);
+  };
+
+  if (!req.session) {
+    finishRedirect();
+    return;
+  }
+
+  req.session.destroy((err) => {
+    if (err) {
+      console.error("[portal] Session destroy before login error:", err);
+    }
+    finishRedirect();
+  });
 }
 
 async function buildClient({
@@ -439,7 +487,7 @@ app.get("/", async (req, res) => {
       <p><b>Required factor:</b> ${adaptive.required_factor || "NONE"}</p>
       <p><b>Auth path:</b> ${adaptive.auth_path || "SSO_ONLY"}</p>
       <p><b>Policy reason:</b> ${adaptive.policy_reason || "n/a"}</p>
-      <p><b>Risk score:</b> ${adaptive.risk_score ?? "n/a"}</p>
+      <p><b>Risk score:</b> ${formatRiskScore(adaptive.risk_score)}</p>
       <p><b>Adaptive auth completed:</b> ${adaptive.completed ? "yes" : "no"}</p>
       ${
         adaptive.biometric_similarity_primary != null
@@ -500,11 +548,7 @@ app.get("/", async (req, res) => {
 
 app.get("/login", (req, res) => {
   if (!portalClient) return res.status(503).send("OIDC client not ready, retry.");
-  res.redirect(
-    portalClient.authorizationUrl({
-      scope: "openid profile email",
-    })
-  );
+  redirectToFreshLogin(req, res, portalClient);
 });
 
 async function sendAppSessionStartedEvent({ userinfo, req, sessionId }) {
@@ -776,7 +820,7 @@ app.get("/callback", async (req, res) => {
       const assess = await assessAdaptiveRisk({ userinfo, req });
 
       adaptiveDecision = {
-        risk_score: assess.risk_score ?? null,
+        risk_score: normalizeRiskScore(assess.risk_score),
         risk_label: assess.risk_label || "unknown",
         decision: assess.decision || "ALLOW",
         required_factor: assess.required_factor || "NONE",
@@ -829,10 +873,7 @@ app.get("/callback", async (req, res) => {
       };
 
       return res.redirect(
-        stepupTotpClient.authorizationUrl({
-          scope: "openid profile email",
-          prompt: "login",
-        })
+        buildFreshLoginUrl(stepupTotpClient)
       );
     }
 
@@ -906,7 +947,7 @@ app.get("/security/setup-face", async (req, res) => {
         `
           <p>L'enrôlement biométrique n'est pas autorisé pendant une session jugée suspecte.</p>
           <p><b>Policy reason:</b> ${adaptive.policy_reason || "n/a"}</p>
-          <p><b>Risk score:</b> ${adaptive.risk_score ?? "n/a"}</p>
+          <p><b>Risk score:</b> ${formatRiskScore(adaptive.risk_score)}</p>
           <p class="small">Reconnecte-toi dans un contexte normal, puis configure ton facteur biométrique.</p>
           <a href="/" class="btn btn-secondary">Retour</a>
           <a href="/logout" class="btn btn-logout">Logout</a>
@@ -998,7 +1039,7 @@ app.get("/adaptive-stepup", async (req, res) => {
         `
           <p>Le niveau de risque est modéré. La vérification OTP native Keycloak est requise.</p>
           <p><b>Policy reason:</b> ${adaptive.policy_reason || "n/a"}</p>
-          <p><b>Risk score:</b> ${adaptive.risk_score ?? "n/a"}</p>
+          <p><b>Risk score:</b> ${formatRiskScore(adaptive.risk_score)}</p>
           <p class="small">Clique ci-dessous pour poursuivre la vérification OTP gérée par Keycloak.</p>
           <a href="/login" class="btn btn-success">Recommencer le parcours</a>
           <a href="/logout" class="btn btn-logout">Logout</a>
@@ -1026,7 +1067,7 @@ app.get("/adaptive-stepup", async (req, res) => {
               <p><b>Problème:</b> aucun profil biométrique n’est encore enrôlé.</p>
               <p><b>Risk label:</b> ${adaptive.risk_label || "high"}</p>
               <p><b>Policy reason:</b> ${adaptive.policy_reason || "n/a"}</p>
-              <p><b>Risk score:</b> ${adaptive.risk_score ?? "n/a"}</p>
+              <p><b>Risk score:</b> ${formatRiskScore(adaptive.risk_score)}</p>
               <p class="small">Par sécurité, l’enrôlement n’est pas autorisé pendant une session déjà jugée à haut risque.</p>
             </div>
             <a href="/logout" class="btn btn-logout">Logout</a>
@@ -1050,7 +1091,7 @@ app.get("/adaptive-stepup", async (req, res) => {
           <p><b>Risk label:</b> ${adaptive.risk_label || "unknown"}</p>
           <p><b>Required factor:</b> ${adaptive.required_factor || "UNKNOWN"}</p>
           <p><b>Policy reason:</b> ${adaptive.policy_reason || "n/a"}</p>
-          <p><b>Risk score:</b> ${adaptive.risk_score ?? "n/a"}</p>
+          <p><b>Risk score:</b> ${formatRiskScore(adaptive.risk_score)}</p>
         `,
       })
     );
@@ -1088,7 +1129,7 @@ app.post("/adaptive-biometric-verify", async (req, res) => {
         infoHtml: `
           <p><b>Risk label:</b> ${adaptive.risk_label || "unknown"}</p>
           <p><b>Policy reason:</b> ${adaptive.policy_reason || "n/a"}</p>
-          <p><b>Risk score:</b> ${adaptive.risk_score ?? "n/a"}</p>
+          <p><b>Risk score:</b> ${formatRiskScore(adaptive.risk_score)}</p>
         `,
         errorMessage: "Les deux captures sont obligatoires.",
       })
@@ -1169,7 +1210,7 @@ app.post("/adaptive-biometric-verify", async (req, res) => {
         infoHtml: `
           <p><b>Risk label:</b> ${adaptive.risk_label || "unknown"}</p>
           <p><b>Policy reason:</b> ${adaptive.policy_reason || "n/a"}</p>
-          <p><b>Risk score:</b> ${adaptive.risk_score ?? "n/a"}</p>
+          <p><b>Risk score:</b> ${formatRiskScore(adaptive.risk_score)}</p>
         `,
         errorMessage: e?.message || "Erreur de vérification biométrique.",
       })
@@ -1191,7 +1232,7 @@ app.get("/adaptive-blocked", (req, res) => {
       <p><b>Risk label:</b> ${adaptive.risk_label || "critical"}</p>
       <p><b>Required factor:</b> ${adaptive.required_factor || "ADMIN_REVIEW"}</p>
       <p><b>Policy reason:</b> ${adaptive.policy_reason || "n/a"}</p>
-      <p><b>Risk score:</b> ${adaptive.risk_score ?? "n/a"}</p>
+      <p><b>Risk score:</b> ${formatRiskScore(adaptive.risk_score)}</p>
       <p class="small">Dans la version finale, cette étape pourra être reliée à une validation administrative ou à une politique de sécurité plus stricte.</p>
     `,
     `<a href="/logout" class="btn btn-logout">Logout</a>`
@@ -1226,6 +1267,8 @@ app.get("/logout", (req, res) => {
       console.error("[portal] Session destroy error:", err);
     }
 
+    res.clearCookie(SESSION_COOKIE_NAME, SESSION_COOKIE_OPTIONS);
+
     if (!idToken) {
       return res.redirect(`${APP_BASE_URL}/`);
     }
@@ -1234,7 +1277,9 @@ app.get("/logout", (req, res) => {
     const postRedirect = encodeURIComponent(`${APP_BASE_URL}/`);
     const url = `${logoutUrl}?id_token_hint=${encodeURIComponent(
       idToken
-    )}&post_logout_redirect_uri=${postRedirect}`;
+    )}&post_logout_redirect_uri=${postRedirect}&client_id=${encodeURIComponent(
+      CLIENT_ID
+    )}`;
 
     res.redirect(url);
   });
