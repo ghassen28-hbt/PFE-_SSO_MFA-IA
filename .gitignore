@@ -1,4 +1,4 @@
-# Node
+# Node / frontend
 node_modules/
 dist/
 build/
@@ -12,8 +12,9 @@ __pycache__/
 *.pyd
 .venv/
 venv/
+.pytest_cache/
 
-# Secrets
+# Secrets / local env
 .env
 .env.*
 SP/.env
@@ -29,6 +30,7 @@ services/biometric-service/data/biometric_profiles.json
 data/GeoLite2-City.mmdb
 ml/training/artifacts/
 ml/training/data/
+ml/training/reports/
 services/biometric-service/models/
 
 # Java / Maven build outputs
@@ -40,13 +42,3 @@ keycloak-spi/**/target/
 .idea/
 .DS_Store
 Thumbs.db
-
-# Accidental junk files
-git
-docker
-python
-SP/{ 
-SP/String(r).toLowerCase())
-SP/rolesNorm.includes(r))
-
-GeoIP.confGeoIP.conf

@@ -18,11 +18,17 @@ MIN_FACE_RATIO = float(os.getenv("MIN_FACE_RATIO", "0.12"))
 MIN_BLUR_SCORE = float(os.getenv("MIN_BLUR_SCORE", "40.0"))
 MIN_BRIGHTNESS = float(os.getenv("MIN_BRIGHTNESS", "25.0"))
 MAX_BRIGHTNESS = float(os.getenv("MAX_BRIGHTNESS", "235.0"))
+MIN_FACE_DETECTION_CONFIDENCE = float(os.getenv("MIN_FACE_DETECTION_CONFIDENCE", "0.70"))
 
 FRONT_YAW_MAX = float(os.getenv("FRONT_YAW_MAX", "0.12"))
 CHALLENGE_YAW_MIN = float(os.getenv("CHALLENGE_YAW_MIN", "0.10"))
 MIN_YAW_DELTA = float(os.getenv("MIN_YAW_DELTA", "0.08"))
 MIN_CROSS_CAPTURE_SIM = float(os.getenv("MIN_CROSS_CAPTURE_SIM", "0.45"))
+ENROLL_FRONT_YAW_MAX = float(os.getenv("ENROLL_FRONT_YAW_MAX", str(FRONT_YAW_MAX)))
+ENROLL_FRONT_ROLL_MAX = float(os.getenv("ENROLL_FRONT_ROLL_MAX", "0.08"))
+MAX_ROLL_DELTA = float(os.getenv("MAX_ROLL_DELTA", "0.10"))
+MAX_FACE_CENTER_SHIFT = float(os.getenv("MAX_FACE_CENTER_SHIFT", "0.12"))
+MAX_FACE_SCALE_DELTA = float(os.getenv("MAX_FACE_SCALE_DELTA", "0.25"))
 
 app = FastAPI(title="Biometric Service", version="1.2.0")
 
@@ -92,15 +98,46 @@ def decode_image(image_base64: str) -> np.ndarray:
     return img
 
 
-def pick_primary_face(faces):
+def ensure_single_face(faces):
     if not faces:
         raise HTTPException(status_code=400, detail="Aucun visage détecté.")
+    if len(faces) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail="Plusieurs visages détectés. Une seule personne doit apparaître devant la caméra.",
+        )
+
+
+def pick_primary_face(faces):
+    ensure_single_face(faces)
 
     def area(face):
         x1, y1, x2, y2 = face.bbox.astype(int).tolist()
         return max(0, x2 - x1) * max(0, y2 - y1)
 
     return sorted(faces, key=area, reverse=True)[0]
+
+
+def face_geometry(img: np.ndarray, face) -> dict:
+    h, w = img.shape[:2]
+    x1, y1, x2, y2 = face.bbox.astype(int).tolist()
+
+    x1 = max(0, x1)
+    y1 = max(0, y1)
+    x2 = min(w, x2)
+    y2 = min(h, y2)
+
+    face_w = max(1, x2 - x1)
+    face_h = max(1, y2 - y1)
+    center_x = ((x1 + x2) / 2.0) / max(w, 1)
+    center_y = ((y1 + y2) / 2.0) / max(h, 1)
+    area_ratio = (face_w * face_h) / max(float(w * h), 1.0)
+
+    return {
+        "bbox_center_x_ratio": round(float(center_x), 4),
+        "bbox_center_y_ratio": round(float(center_y), 4),
+        "bbox_area_ratio": round(float(area_ratio), 4),
+    }
 
 
 def estimate_pose(face) -> dict:
@@ -178,6 +215,40 @@ def image_quality_checks(img: np.ndarray, face) -> dict:
     return checks
 
 
+def validate_face_detection(face_confidence: float):
+    if face_confidence < MIN_FACE_DETECTION_CONFIDENCE:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Détection faciale trop faible. Confidence={round(face_confidence, 4)}, "
+                f"minimum={MIN_FACE_DETECTION_CONFIDENCE}."
+            ),
+        )
+
+
+def validate_enrollment_pose(meta: dict):
+    yaw = abs(float(meta.get("yaw_proxy", 0.0)))
+    roll = abs(float(meta.get("roll_proxy", 0.0)))
+
+    if yaw > ENROLL_FRONT_YAW_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Pour l'enrôlement, le visage doit rester frontal. "
+                f"Yaw détecté={round(yaw, 4)}, maximum={ENROLL_FRONT_YAW_MAX}."
+            ),
+        )
+
+    if roll > ENROLL_FRONT_ROLL_MAX:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Pour l'enrôlement, évite d'incliner la tête ou l'écran. "
+                f"Roll détecté={round(roll, 4)}, maximum={ENROLL_FRONT_ROLL_MAX}."
+            ),
+        )
+
+
 def extract_face_data(img: np.ndarray) -> Tuple[np.ndarray, dict]:
     face_app = get_face_app()
     faces = face_app.get(img)
@@ -185,16 +256,20 @@ def extract_face_data(img: np.ndarray) -> Tuple[np.ndarray, dict]:
     face = pick_primary_face(faces)
     quality = image_quality_checks(img, face)
     pose = estimate_pose(face)
+    geometry = face_geometry(img, face)
 
     embedding = getattr(face, "embedding", None)
     if embedding is None:
         raise HTTPException(status_code=500, detail="Embedding facial indisponible.")
 
     confidence = float(getattr(face, "det_score", 0.0) or 0.0)
+    validate_face_detection(confidence)
 
     return np.asarray(embedding, dtype=np.float32), {
         **quality,
         **pose,
+        **geometry,
+        "detected_faces": len(faces),
         "face_confidence": round(confidence, 4),
     }
 
@@ -213,7 +288,24 @@ def evaluate_liveness(primary_meta: dict, challenge_meta: dict, challenge_type: 
 
     yaw_primary = float(primary_meta.get("yaw_proxy", 0.0))
     yaw_challenge = float(challenge_meta.get("yaw_proxy", 0.0))
+    roll_primary = float(primary_meta.get("roll_proxy", 0.0))
+    roll_challenge = float(challenge_meta.get("roll_proxy", 0.0))
     motion_delta = round(yaw_challenge - yaw_primary, 4)
+    roll_delta = round(abs(roll_challenge - roll_primary), 4)
+    center_shift = round(
+        float(
+            np.hypot(
+                float(challenge_meta.get("bbox_center_x_ratio", 0.0))
+                - float(primary_meta.get("bbox_center_x_ratio", 0.0)),
+                float(challenge_meta.get("bbox_center_y_ratio", 0.0))
+                - float(primary_meta.get("bbox_center_y_ratio", 0.0)),
+            )
+        ),
+        4,
+    )
+    primary_area = max(float(primary_meta.get("bbox_area_ratio", 0.0)), 1e-6)
+    challenge_area = float(challenge_meta.get("bbox_area_ratio", 0.0))
+    scale_delta = round(abs(challenge_area - primary_area) / primary_area, 4)
 
     primary_frontal_ok = abs(yaw_primary) <= FRONT_YAW_MAX
 
@@ -222,12 +314,20 @@ def evaluate_liveness(primary_meta: dict, challenge_meta: dict, challenge_type: 
     else:
         challenge_ok = yaw_challenge <= -CHALLENGE_YAW_MIN and motion_delta <= -MIN_YAW_DELTA
 
-    liveness_passed = primary_frontal_ok and challenge_ok
+    framing_ok = center_shift <= MAX_FACE_CENTER_SHIFT and scale_delta <= MAX_FACE_SCALE_DELTA
+    roll_ok = roll_delta <= MAX_ROLL_DELTA
+    liveness_passed = primary_frontal_ok and challenge_ok and framing_ok and roll_ok
 
     if not primary_frontal_ok:
         reason = "primary_not_frontal"
     elif not challenge_ok:
         reason = f"{challenge_type}_not_detected"
+    elif not roll_ok:
+        reason = "roll_delta_too_large"
+    elif not framing_ok and center_shift > MAX_FACE_CENTER_SHIFT:
+        reason = "framing_shift_too_large"
+    elif not framing_ok:
+        reason = "face_scale_changed_too_much"
     else:
         reason = "active_liveness_passed"
 
@@ -237,8 +337,15 @@ def evaluate_liveness(primary_meta: dict, challenge_meta: dict, challenge_type: 
         "challenge_type": challenge_type,
         "yaw_primary": round(yaw_primary, 4),
         "yaw_challenge": round(yaw_challenge, 4),
+        "roll_primary": round(roll_primary, 4),
+        "roll_challenge": round(roll_challenge, 4),
         "motion_delta": motion_delta,
+        "roll_delta": roll_delta,
+        "center_shift": center_shift,
+        "scale_delta": scale_delta,
         "primary_frontal_ok": primary_frontal_ok,
+        "roll_ok": roll_ok,
+        "framing_ok": framing_ok,
     }
 
 
@@ -284,6 +391,7 @@ def get_profile(user_id: str):
 def enroll(payload: EnrollRequest):
     img = decode_image(payload.image_base64)
     embedding, meta = extract_face_data(img)
+    validate_enrollment_pose(meta)
 
     quality_score = round(
         min(
@@ -315,10 +423,15 @@ def enroll(payload: EnrollRequest):
         "face_confidence": record["face_confidence"],
         "model": record["model"],
         "quality_checks": {
+            "detected_faces": meta["detected_faces"],
             "face_ratio": meta["face_ratio"],
             "blur_score": meta["blur_score"],
             "brightness": meta["brightness"],
             "yaw_proxy": meta["yaw_proxy"],
+            "roll_proxy": meta["roll_proxy"],
+            "bbox_center_x_ratio": meta["bbox_center_x_ratio"],
+            "bbox_center_y_ratio": meta["bbox_center_y_ratio"],
+            "bbox_area_ratio": meta["bbox_area_ratio"],
         },
     }
 
@@ -347,8 +460,15 @@ def verify(payload: VerifyRequest):
         "challenge_type": payload.challenge_type,
         "yaw_primary": primary_meta["yaw_proxy"],
         "yaw_challenge": None,
+        "roll_primary": primary_meta["roll_proxy"],
+        "roll_challenge": None,
         "motion_delta": 0.0,
+        "roll_delta": 0.0,
+        "center_shift": 0.0,
+        "scale_delta": 0.0,
         "primary_frontal_ok": True,
+        "roll_ok": True,
+        "framing_ok": True,
     }
 
     if payload.enforce_liveness:
@@ -411,19 +531,36 @@ def verify(payload: VerifyRequest):
         "challenge_type": liveness["challenge_type"],
         "yaw_primary": liveness["yaw_primary"],
         "yaw_challenge": liveness["yaw_challenge"],
+        "roll_primary": liveness["roll_primary"],
+        "roll_challenge": liveness["roll_challenge"],
         "motion_delta": liveness["motion_delta"],
+        "roll_delta": liveness["roll_delta"],
+        "center_shift": liveness["center_shift"],
+        "scale_delta": liveness["scale_delta"],
         "primary_frontal_ok": liveness["primary_frontal_ok"],
+        "roll_ok": liveness["roll_ok"],
+        "framing_ok": liveness["framing_ok"],
         "quality_checks_primary": {
+            "detected_faces": primary_meta["detected_faces"],
             "face_ratio": primary_meta["face_ratio"],
             "blur_score": primary_meta["blur_score"],
             "brightness": primary_meta["brightness"],
             "yaw_proxy": primary_meta["yaw_proxy"],
+            "roll_proxy": primary_meta["roll_proxy"],
+            "bbox_center_x_ratio": primary_meta["bbox_center_x_ratio"],
+            "bbox_center_y_ratio": primary_meta["bbox_center_y_ratio"],
+            "bbox_area_ratio": primary_meta["bbox_area_ratio"],
         },
         "quality_checks_challenge": None if challenge_meta is None else {
+            "detected_faces": challenge_meta["detected_faces"],
             "face_ratio": challenge_meta["face_ratio"],
             "blur_score": challenge_meta["blur_score"],
             "brightness": challenge_meta["brightness"],
             "yaw_proxy": challenge_meta["yaw_proxy"],
+            "roll_proxy": challenge_meta["roll_proxy"],
+            "bbox_center_x_ratio": challenge_meta["bbox_center_x_ratio"],
+            "bbox_center_y_ratio": challenge_meta["bbox_center_y_ratio"],
+            "bbox_area_ratio": challenge_meta["bbox_area_ratio"],
         },
         "face_confidence_primary": primary_meta["face_confidence"],
         "face_confidence_challenge": None if challenge_meta is None else challenge_meta["face_confidence"],

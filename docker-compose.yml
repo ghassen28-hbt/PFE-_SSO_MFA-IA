@@ -37,6 +37,34 @@ services:
       - ./ml/training:/training
     restart: unless-stopped
 
+  training-scheduler:
+    build:
+      context: .
+      dockerfile: ./scripts/Dockerfile.training-scheduler
+    container_name: pfe_training_scheduler
+    environment:
+      CLICKHOUSE_HOST: clickhouse
+      CLICKHOUSE_PORT: "8123"
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: admin123
+      CLICKHOUSE_DATABASE: iam
+      AUTO_TRAIN_ENABLED: "true"
+      AUTO_TRAIN_INTERVAL_SECONDS: "604800"
+      AUTO_TRAIN_RUN_ON_START: "true"
+      AUTO_TRAIN_BIOMETRIC_CHECK: "true"
+      AUTO_TRAIN_BIOMETRIC_URL: http://biometric-service:8091/health
+      AUTO_TRAIN_MIN_MACRO_F1: "0.80"
+      AUTO_TRAIN_MIN_BALANCED_ACCURACY: "0.75"
+    volumes:
+      - ./ml/training:/workspace/ml/training
+      - ./ml/scoring-service:/workspace/ml/scoring-service:ro
+      - ./scripts:/workspace/scripts:ro
+      - ./tests:/workspace/tests:ro
+    depends_on:
+      - clickhouse
+      - biometric-service
+    restart: unless-stopped
+
   event-collector:
     build: ./services/event-collector
     container_name: pfesso-event-collector-1
@@ -77,9 +105,15 @@ services:
       MIN_BLUR_SCORE: "25.0"
       MIN_BRIGHTNESS: "25.0"
       MAX_BRIGHTNESS: "235.0"
+      MIN_FACE_DETECTION_CONFIDENCE: "0.70"
       FRONT_YAW_MAX: "0.08"
+      ENROLL_FRONT_YAW_MAX: "0.06"
+      ENROLL_FRONT_ROLL_MAX: "0.06"
       CHALLENGE_YAW_MIN: "0.10"
       MIN_YAW_DELTA: "0.08"
+      MAX_ROLL_DELTA: "0.10"
+      MAX_FACE_CENTER_SHIFT: "0.12"
+      MAX_FACE_SCALE_DELTA: "0.25"
       MIN_CROSS_CAPTURE_SIM: "0.55"
     volumes:
       - ./services/biometric-service/data:/app/data
@@ -98,7 +132,7 @@ services:
       KEYCLOAK_ADMIN: admin
       KEYCLOAK_ADMIN_PASSWORD: admin
       KC_HTTP_ENABLED: "true"
-      KC_HOSTNAME: "https://lowest-cooking-pas-swing.trycloudflare.com"
+      KC_HOSTNAME: "https://starting-deals-yes-sara.trycloudflare.com"
       KC_HOSTNAME_STRICT: "false"
       KC_PROXY_HEADERS: "xforwarded"
       KC_SPI_EVENTS_LISTENER_RISK_EVENT_LISTENER_COLLECTOR_URL: "http://event-collector:8088/events"

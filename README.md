@@ -1,148 +1,54 @@
-<<<<<<< HEAD
-# SSO + MFA + IA — Système d'Authentification Adaptative
+# PFE SSO + MFA + IA
 
-> Projet de Fin d'Études — Architecture microservices avec Keycloak, OIDC, MFA et scoring IA (LightGBM)
+Architecture de démonstration pour une authentification adaptative basée sur Keycloak, MFA, scoring de risque ML et audit des événements.
 
----
+## Services principaux
+- `keycloak`: SSO/OIDC et orchestration MFA
+- `event-collector`: enrichissement des événements de login et persistance ClickHouse
+- `scoring-service`: inférence du modèle de risque multiclasses + règles critiques
+- `SP/*`: applications clientes de démonstration
 
-## 📁 Structure du monorepo
+## Pipeline ML
+Le pipeline complet de risk scoring est documenté ici:
 
-```
-sso-mfa-ia-project/
-│
-├── services/                    # Microservices backend
-│   ├── keycloak/                # Configuration et extensions Keycloak (IdP)
-│   ├── ai-risk-service/         # Service IA de scoring de risque (Python/FastAPI)
-│   ├── api-gateway/             # Passerelle API (Kong / Traefik)
-│   ├── audit-service/           # Journalisation et export SIEM
-│   ├── notification-service/    # Alertes email/SMS
-│   └── mfa-service/             # Gestion des facteurs MFA
-│
-├── apps/                        # Applications clientes de démonstration
-│   ├── web-client/              # Frontend React (application protégée par SSO)
-│   └── demo-api/                # API REST protégée (FastAPI)
-│
-├── infra/                       # Infrastructure as Code
-│   ├── docker/                  # Dockerfiles spécifiques
-│   ├── kubernetes/              # Manifests K8s et charts Helm
-│   └── scripts/                 # Scripts d'initialisation et d'automatisation
-│
-├── data/                        # Données ML
-│   ├── datasets/                # Dataset RBA et données générées
-│   └── models/                  # Modèles entraînés (.pkl, .lgbm)
-│
-├── docs/                        # Documentation du projet
-│   ├── architecture/            # Schémas et décisions d'architecture
-│   ├── api/                     # Documentation des APIs
-│   └── guides/                  # Guides d'installation et d'utilisation
-│
-├── .github/workflows/           # Pipelines CI/CD (GitHub Actions)
-├── docker-compose.yml           # Orchestration dev/test complète
-├── docker-compose.override.yml  # Overrides locaux (non commité)
-├── .env.example                 # Variables d'environnement (modèle)
-└── Makefile                     # Commandes pratiques (make up, make test...)
+- [documentation/RISK_SCORING_PIPELINE_V2.md](/c:/Users/SBS/Desktop/PFE%202026/SSO%20+%20GH/PFE-_SSO_MFA-IA/documentation/RISK_SCORING_PIPELINE_V2.md)
+
+## Commandes utiles
+
+Régénérer le dataset synthétique:
+
+```powershell
+python ml/training/generate_synthetic_dataset.py
 ```
 
----
+Reconstruire le dataset final synthétique + réel:
 
-## 🚀 Démarrage rapide
-
-### Prérequis
-- Docker >= 24.x
-- Docker Compose >= 2.x
-- Python 3.11+
-- Node.js 18+ (pour le frontend)
-- Git
-
-### Installation
-
-```bash
-# 1. Cloner le dépôt
-git clone https://github.com/<ton-username>/sso-mfa-ia-project.git
-cd sso-mfa-ia-project
-
-# 2. Copier les variables d'environnement
-cp .env.example .env
-# → Éditer .env avec tes valeurs
-
-# 3. Lancer toute la stack
-make up
-# ou : docker compose up -d
-
-# 4. Accéder aux services
-# Keycloak Admin : http://localhost:8080
-# Service IA     : http://localhost:8001/docs
-# App Web        : http://localhost:3000
-# Kibana (logs)  : http://localhost:5601
+```powershell
+python ml/training/build_training_dataset.py
 ```
 
----
+Réentraîner le modèle:
 
-## 🧩 Services
+```powershell
+python ml/training/train_risk_model.py
+```
 
-| Service | Port | Technologie | Description |
-|---------|------|-------------|-------------|
-| Keycloak | 8080 | Java / Quarkus | Fournisseur d'identité SSO |
-| PostgreSQL | 5432 | PostgreSQL 15 | Base de données Keycloak |
-| AI Risk Service | 8001 | Python / FastAPI | Scoring de risque IA |
-| API Gateway | 8000 | Kong / Traefik | Point d'entrée unique |
-| Audit Service | 8002 | Python / FastAPI | Logs et journalisation |
-| Notification | 8003 | Python / FastAPI | Alertes email/SMS |
-| Web Client | 3000 | React / Vite | App démo protégée par SSO |
-| Demo API | 8004 | FastAPI | API protégée par JWT |
-| Elasticsearch | 9200 | Elasticsearch 8 | Stockage des logs |
-| Kibana | 5601 | Kibana 8 | Dashboard de monitoring |
+Lancer le retraining automatique complet:
 
----
+```powershell
+python scripts/auto_train.py --biometric-check
+```
 
-## 🌿 Branches Git
+Le mode 100% automatique est aussi activé dans Docker Compose via `training-scheduler`: après démarrage de la stack, il relance périodiquement le pipeline selon `AUTO_TRAIN_INTERVAL_SECONDS` et le scoring service recharge les nouveaux artefacts automatiquement.
 
-| Branche | Usage |
-|---------|-------|
-| `main` | Code stable, validé |
-| `develop` | Intégration continue |
-| `feature/keycloak-setup` | Développement d'une fonctionnalité |
-| `feature/ai-scoring` | Module IA |
-| `fix/mfa-flow` | Correction de bug |
-| `release/v1.0` | Préparation release |
+Relancer les services de scoring:
 
----
+```powershell
+docker compose up -d --build scoring-service event-collector
+```
 
-## 👥 Équipe et contacts
-- Encadrant : ...
-- Développeur : ...
+Tester l'API:
 
----
-
-## 📄 Licence
-Projet académique — Usage interne PFE uniquement.
-
-
-## Phase A SSO :
-# PFE SSO MFA IA - Phase A
-
-## Prérequis
-- Docker Desktop
-- Node.js
-- npm
-- Git
-
-## Installation
-
-1. Cloner le projet
-2. Lancer Docker :
-   docker compose up -d
-3. Importer le realm Keycloak depuis :
-   keycloak/realm-export.json
-4. Installer les dépendances :
-   npm install dans dossier sp 
-   
-5. Lancer les applications
-
-## Keycloak
-- URL: http://localhost:8081
-- Admin user: admin
-- Admin password: admin
-=======
-# PFE_SSO
->>>>>>> 82530584ab174d3a61574cdbeb0bff9c89e401ae
+```powershell
+Invoke-RestMethod -Method Post -Uri http://localhost:8090/score -ContentType 'application/json' -Body '{"client_id":"portal-main-client","app_sensitivity":1,"ua_browser":"Brave 146.0.0.0","ua_os":"Windows 11","ua_device":"pc","geo_country_code":"TN","asn_org":"Orange Tunisie","hour":10,"day_of_week":5,"is_weekend":0,"is_night_login":0,"is_business_hours":1,"is_new_device":0,"is_new_ip_for_user":0,"fails_5m":0,"fails_1h":0,"fails_24h":0,"login_1h":1,"is_vpn_detected":0,"is_proxy_detected":0,"is_tor":0,"distance_from_last_location_km":0,"is_impossible_travel":0,"abuse_confidence_score":0}'
+```

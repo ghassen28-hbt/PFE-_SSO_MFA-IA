@@ -1,6 +1,7 @@
-pandas
-scikit-learn
-lightgbm
-clickhouse-connect
-joblib
-python-dotenv
+pandas==2.2.3
+scikit-learn==1.6.1
+lightgbm==4.6.0
+xgboost-cpu==2.1.4
+clickhouse-connect==0.14.1
+joblib==1.5.0
+python-dotenv==1.2.2

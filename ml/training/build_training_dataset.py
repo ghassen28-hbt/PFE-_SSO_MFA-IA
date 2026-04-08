@@ -5,6 +5,12 @@ import clickhouse_connect
 import pandas as pd
 from dotenv import load_dotenv
 
+from pipeline_schema import (
+    DATASET_COLUMNS,
+    RISK_LABEL_TO_CLASS,
+    normalize_dataset_schema,
+)
+
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -18,40 +24,37 @@ CLICKHOUSE_USER = os.getenv("CLICKHOUSE_USER", "default")
 CLICKHOUSE_PASSWORD = os.getenv("CLICKHOUSE_PASSWORD", "")
 CLICKHOUSE_DATABASE = os.getenv("CLICKHOUSE_DATABASE", "iam")
 HISTORY_RESET_AT = os.getenv("HISTORY_RESET_AT", "").strip()
+STEP_UP_CLIENT_IDS_RAW = os.getenv("STEP_UP_CLIENT_IDS", "portal-stepup-totp-client")
 
 REAL_OUTPUT_PATH = DATA_DIR / "real_export.csv"
 SYNTHETIC_INPUT_PATH = DATA_DIR / "synthetic_risk_dataset.csv"
 FINAL_OUTPUT_PATH = DATA_DIR / "training_dataset_final.csv"
 
-RISK_CLASS_MAP = {
-    "low": 0,
-    "moderate": 1,
-    "high": 2,
-    "critical": 3,
-}
 
-EXPECTED_COLS = [
-    "event_time",
-    "client_id",
-    "app_sensitivity",
-    "ua_browser",
-    "ua_os",
-    "ua_device",
-    "hour",
-    "day_of_week",
-    "is_weekend",
-    "is_night_login",
-    "is_business_hours",
-    "is_new_device",
-    "is_new_ip_for_user",
-    "fails_5m",
-    "fails_1h",
-    "fails_24h",
-    "login_1h",
-    "risk_label",
-    "risk_class",
-    "data_origin",
-]
+def parse_csv_set(raw: str) -> set:
+    return {
+        item.strip()
+        for item in str(raw or "").split(",")
+        if item and item.strip()
+    }
+
+
+def sql_escape(value: str) -> str:
+    return str(value).replace("\\", "\\\\").replace("'", "\\'")
+
+
+STEP_UP_CLIENT_IDS = parse_csv_set(STEP_UP_CLIENT_IDS_RAW)
+
+
+def step_up_client_exclusion_sql(column: str = "client_id") -> str:
+    if not STEP_UP_CLIENT_IDS:
+        return "1 = 1"
+
+    values = ", ".join(
+        f"'{sql_escape(client_id)}'"
+        for client_id in sorted(STEP_UP_CLIENT_IDS)
+    )
+    return f"{column} NOT IN ({values})"
 
 
 def export_real_data() -> pd.DataFrame:
@@ -68,12 +71,11 @@ def export_real_data() -> pd.DataFrame:
         "event_success = 1",
         "scoring_status = 'ok'",
         "lower(risk_label) IN ('low', 'moderate', 'high', 'critical')",
+        step_up_client_exclusion_sql(),
     ]
 
     if HISTORY_RESET_AT:
-        where_clauses.append(
-            f"event_time >= toDateTime('{HISTORY_RESET_AT}')"
-        )
+        where_clauses.append(f"event_time >= toDateTime('{HISTORY_RESET_AT}')")
 
     query = f"""
     SELECT
@@ -83,6 +85,8 @@ def export_real_data() -> pd.DataFrame:
         ua_browser,
         ua_os,
         ua_device,
+        geo_country_code,
+        asn_org,
         hour,
         day_of_week,
         is_weekend,
@@ -94,18 +98,28 @@ def export_real_data() -> pd.DataFrame:
         fails_1h,
         fails_24h,
         login_1h,
-        lower(risk_label) AS risk_label
+        is_vpn_detected,
+        is_proxy_detected,
+        is_tor,
+        distance_from_last_location_km,
+        is_impossible_travel,
+        abuse_confidence_score,
+        risk_score AS source_risk_score,
+        lower(risk_label) AS source_risk_label,
+        decision AS source_decision,
+        policy_reason AS source_policy_reason
     FROM {CLICKHOUSE_DATABASE}.login_events
     WHERE {" AND ".join(where_clauses)}
     ORDER BY event_time ASC
     """
 
     df = client.query_df(query)
-
     if df.empty:
         return df
 
-    df["risk_class"] = df["risk_label"].map(RISK_CLASS_MAP).astype("Int64")
+    df["risk_label"] = df["source_risk_label"].astype(str).str.lower()
+    df["risk_class"] = df["risk_label"].map(RISK_LABEL_TO_CLASS).astype("Int64")
+    df["synthetic_rule_score"] = None
     df["data_origin"] = "real"
     return df
 
@@ -118,36 +132,18 @@ def load_synthetic_data() -> pd.DataFrame:
         )
 
     df = pd.read_csv(SYNTHETIC_INPUT_PATH)
-
-    if "risk_label" not in df.columns and "risk_class" in df.columns:
-        reverse_map = {value: key for key, value in RISK_CLASS_MAP.items()}
-        df["risk_label"] = pd.to_numeric(
-            df["risk_class"], errors="coerce"
-        ).map(reverse_map)
-
-    if "risk_class" not in df.columns and "risk_label" in df.columns:
-        df["risk_class"] = (
-            df["risk_label"].astype(str).str.lower().map(RISK_CLASS_MAP)
-        )
-
     if "data_origin" not in df.columns:
         df["data_origin"] = "synthetic"
-
     return df
 
 
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    for col in EXPECTED_COLS:
-        if col not in df.columns:
-            df[col] = None
-
-    df = df[EXPECTED_COLS].copy()
-
-    df["event_time"] = pd.to_datetime(df["event_time"], errors="coerce")
-    df["risk_label"] = df["risk_label"].astype(str).str.lower()
-    df["risk_class"] = pd.to_numeric(df["risk_class"], errors="coerce").astype("Int64")
-
-    return df
+def validate_target_classes(df: pd.DataFrame, dataset_name: str):
+    invalid_rows = df[~df["risk_label"].isin(RISK_LABEL_TO_CLASS.keys())]
+    if not invalid_rows.empty:
+        raise ValueError(
+            f"{dataset_name} contains unknown labels: "
+            f"{sorted(invalid_rows['risk_label'].dropna().unique().tolist())}"
+        )
 
 
 def print_distribution(df: pd.DataFrame, prefix: str):
@@ -160,7 +156,8 @@ def print_distribution(df: pd.DataFrame, prefix: str):
 def main():
     print("Exporting real login events from ClickHouse...")
     real_df = export_real_data()
-    real_df = normalize_columns(real_df)
+    real_df = normalize_dataset_schema(real_df)
+    validate_target_classes(real_df[real_df["risk_class"].notna()], "Real export")
     real_df.to_csv(REAL_OUTPUT_PATH, index=False)
     print(f"Real export saved: {REAL_OUTPUT_PATH}")
     print(f"Real rows: {len(real_df)}")
@@ -169,15 +166,18 @@ def main():
 
     print("\nLoading synthetic dataset...")
     synthetic_df = load_synthetic_data()
-    synthetic_df = normalize_columns(synthetic_df)
+    synthetic_df = normalize_dataset_schema(synthetic_df)
+    validate_target_classes(synthetic_df[synthetic_df["risk_class"].notna()], "Synthetic dataset")
     print(f"Synthetic rows: {len(synthetic_df)}")
     print_distribution(synthetic_df, "Synthetic")
 
     print("\nMerging datasets...")
     final_df = pd.concat([real_df, synthetic_df], ignore_index=True)
+    final_df = normalize_dataset_schema(final_df)
     final_df = final_df.dropna(subset=["event_time", "risk_class"]).copy()
     final_df["risk_class"] = final_df["risk_class"].astype(int)
     final_df = final_df.sort_values("event_time", na_position="last").reset_index(drop=True)
+    final_df = final_df[DATASET_COLUMNS].copy()
 
     final_df.to_csv(FINAL_OUTPUT_PATH, index=False)
 

@@ -43,7 +43,11 @@ SCORING_ENABLED = os.getenv("SCORING_ENABLED", "true").lower() == "true"
 SCORING_URL = os.getenv("SCORING_URL", "http://host.docker.internal:8090/score")
 SCORING_TIMEOUT = int(os.getenv("SCORING_TIMEOUT", "5"))
 RECENT_LOGIN_LOOKBACK_MINUTES = int(os.getenv("RECENT_LOGIN_LOOKBACK_MINUTES", "3"))
+STEP_UP_LOGIN_LOOKBACK_MINUTES = int(
+    os.getenv("STEP_UP_LOGIN_LOOKBACK_MINUTES", str(max(RECENT_LOGIN_LOOKBACK_MINUTES, 10)))
+)
 HISTORY_RESET_AT_RAW = os.getenv("HISTORY_RESET_AT", "").strip()
+STEP_UP_CLIENT_IDS_RAW = os.getenv("STEP_UP_CLIENT_IDS", "portal-stepup-totp-client")
 
 _http = requests.Session()
 
@@ -67,6 +71,32 @@ def sql_escape(value: str) -> str:
     if value is None:
         return ""
     return str(value).replace("\\", "\\\\").replace("'", "\\'")
+
+
+def parse_csv_set(raw: str) -> set:
+    return {
+        item.strip()
+        for item in str(raw or "").split(",")
+        if item and item.strip()
+    }
+
+
+STEP_UP_CLIENT_IDS = parse_csv_set(STEP_UP_CLIENT_IDS_RAW)
+
+
+def is_step_up_client(client_id: str) -> bool:
+    return str(client_id or "").strip() in STEP_UP_CLIENT_IDS
+
+
+def step_up_client_exclusion_sql(column: str = "client_id") -> str:
+    if not STEP_UP_CLIENT_IDS:
+        return "1 = 1"
+
+    values = ", ".join(
+        f"'{sql_escape(client_id)}'"
+        for client_id in sorted(STEP_UP_CLIENT_IDS)
+    )
+    return f"{column} NOT IN ({values})"
 
 
 # ============================================================
@@ -424,6 +454,7 @@ def login_count_hours(
     WHERE {identity_filter}
       AND event_type = 'LOGIN'
       AND event_success = 1
+      AND {step_up_client_exclusion_sql()}
       AND event_time >= toDateTime('{since_str}')
       AND event_time <= toDateTime('{until_str}')
     """
@@ -443,6 +474,7 @@ def successful_login_count(
         identity_filter,
         "event_type = 'LOGIN'",
         "event_success = 1",
+        step_up_client_exclusion_sql(),
     ]
 
     if HISTORY_RESET_AT is not None:
@@ -483,6 +515,7 @@ def get_recent_login_scoring(
     ip: str = "",
     ref_time: Optional[datetime] = None,
     lookback_minutes: int = RECENT_LOGIN_LOOKBACK_MINUTES,
+    exclude_step_up_clients: bool = True,
 ):
     identity_filter = build_identity_filter(user_id, username)
     if identity_filter == "1 = 0":
@@ -504,11 +537,23 @@ def get_recent_login_scoring(
 
     if client_id:
         clauses.append(f"client_id = '{sql_escape(client_id)}'")
+    if exclude_step_up_clients:
+        clauses.append(step_up_client_exclusion_sql())
     if ip:
         clauses.append(f"ip = '{sql_escape(ip)}'")
 
     sql = f"""
-    SELECT risk_score, risk_label, decision, required_factor, auth_path, policy_reason
+    SELECT
+      risk_score,
+      risk_label,
+      decision,
+      required_factor,
+      auth_path,
+      policy_reason,
+      distance_from_last_location_km,
+      is_impossible_travel,
+      is_new_ip_for_user,
+      is_new_device
     FROM {TABLE}
     WHERE {" AND ".join(clauses)}
     ORDER BY event_time DESC
@@ -520,7 +565,7 @@ def get_recent_login_scoring(
         return None
 
     parts = result.split("\t")
-    if len(parts) != 6:
+    if len(parts) < 6:
         return None
 
     return {
@@ -530,6 +575,10 @@ def get_recent_login_scoring(
         "required_factor": parts[3] or "NONE",
         "auth_path": parts[4] or "SSO_ONLY",
         "policy_reason": parts[5] or "unknown_policy_reason",
+        "distance_from_last_location_km": float(parts[6]) if len(parts) > 6 and parts[6] else None,
+        "is_impossible_travel": int(parts[7]) if len(parts) > 7 and parts[7] else None,
+        "is_new_ip_for_user": int(parts[8]) if len(parts) > 8 and parts[8] else None,
+        "is_new_device": int(parts[9]) if len(parts) > 9 and parts[9] else None,
     }
 
 
@@ -545,6 +594,7 @@ def is_new_device(user_id: str, username: str, fp: str):
     WHERE {identity_filter}
       AND event_type = 'LOGIN'
       AND event_success = 1
+      AND {step_up_client_exclusion_sql()}
       AND device_fp = '{sql_escape(fp)}'
       {time_filter}
     """
@@ -565,6 +615,7 @@ def is_new_ip_for_user(user_id: str, username: str, ip: str):
     WHERE {identity_filter}
       AND event_type = 'LOGIN'
       AND event_success = 1
+      AND {step_up_client_exclusion_sql()}
       AND ip = '{sql_escape(ip)}'
       {time_filter}
     """
@@ -577,9 +628,17 @@ def get_last_distinct_successful_location(
     current_ip: str,
     current_lat: float,
     current_lon: float,
+    trusted_only: bool = True,
 ):
     identity_filter = build_identity_filter(user_id, username)
     current_ip = sql_escape(current_ip)
+    trust_filter = ""
+    if trusted_only:
+        trust_filter = """
+      AND is_vpn_detected = 0
+      AND is_proxy_detected = 0
+      AND is_tor = 0
+        """
 
     sql = f"""
     SELECT ip, geo_latitude, geo_longitude, event_time
@@ -587,8 +646,10 @@ def get_last_distinct_successful_location(
     WHERE {identity_filter}
       AND event_type = 'LOGIN'
       AND event_success = 1
+      AND {step_up_client_exclusion_sql()}
       AND geo_latitude != 0
       AND geo_longitude != 0
+      {trust_filter}
       {"AND event_time >= toDateTime('" + HISTORY_RESET_AT.strftime("%Y-%m-%d %H:%M:%S") + "')" if HISTORY_RESET_AT is not None else ""}
     ORDER BY event_time DESC
     LIMIT 10
@@ -671,7 +732,17 @@ def compute_travel_features(
         current_ip=current_ip,
         current_lat=current_lat,
         current_lon=current_lon,
+        trusted_only=True,
     )
+    if not previous:
+        previous = get_last_distinct_successful_location(
+            user_id=user_id,
+            username=username,
+            current_ip=current_ip,
+            current_lat=current_lat,
+            current_lon=current_lon,
+            trusted_only=False,
+        )
 
     if not previous:
         return 0.0, 0
@@ -874,7 +945,7 @@ def build_event_context(data: dict, req: Request, event_type: str = "ASSESS"):
             new_dev = is_new_device(user_id, username, fp)
             new_ip = is_new_ip_for_user(user_id, username, ip)
 
-        if event_type == "LOGIN" and event_success == 1:
+        if event_type == "LOGIN" and event_success == 1 and not is_step_up_client(client_id):
             login_1h += 1
 
     ip_data = enrich_ip(ip)
@@ -923,17 +994,17 @@ def build_event_context(data: dict, req: Request, event_type: str = "ASSESS"):
     distance_from_last_location_km = 0.0
     is_impossible_travel = 0
 
-    trusted_geo = (
+    geo_available_for_travel = (
         event_type == "LOGIN"
         and event_success == 1
         and ip
         and is_public_ip(ip)
-        and vpn_proxy["is_vpn_detected"] == 0
-        and vpn_proxy["is_proxy_detected"] == 0
         and geo_country_code != ""
+        and geo_latitude != 0
+        and geo_longitude != 0
     )
 
-    if trusted_geo and identity_available:
+    if geo_available_for_travel and identity_available:
         distance_from_last_location_km, is_impossible_travel = compute_travel_features(
             user_id=user_id,
             username=username,
@@ -951,6 +1022,8 @@ def build_event_context(data: dict, req: Request, event_type: str = "ASSESS"):
         "ua_browser": ua_browser or "unknown",
         "ua_os": ua_os or "unknown",
         "ua_device": ua_device or "unknown",
+        "geo_country_code": geo_country_code or "unknown",
+        "asn_org": asn_org or "unknown",
         "hour": hour,
         "day_of_week": dow,
         "is_weekend": weekend,
@@ -962,6 +1035,12 @@ def build_event_context(data: dict, req: Request, event_type: str = "ASSESS"):
         "fails_1h": fails_1h,
         "fails_24h": fails_24h,
         "login_1h": login_1h,
+        "is_vpn_detected": vpn_proxy["is_vpn_detected"],
+        "is_proxy_detected": vpn_proxy["is_proxy_detected"],
+        "is_tor": is_tor,
+        "distance_from_last_location_km": distance_from_last_location_km,
+        "is_impossible_travel": is_impossible_travel,
+        "abuse_confidence_score": abuse_score,
     }
 
     return {
@@ -1087,6 +1166,69 @@ def row_from_context(context: dict, scoring_result: Optional[dict] = None) -> di
     }
 
 
+INHERITED_RECENT_LOGIN_FEATURES = [
+    "distance_from_last_location_km",
+    "is_impossible_travel",
+    "is_new_ip_for_user",
+    "is_new_device",
+]
+
+
+def inherit_recent_login_features(context: dict, scoring_result: dict):
+    for inherited_feature in INHERITED_RECENT_LOGIN_FEATURES:
+        if scoring_result.get(inherited_feature) is None:
+            continue
+
+        context[inherited_feature] = scoring_result[inherited_feature]
+        if inherited_feature in context.get("scoring_features", {}):
+            context["scoring_features"][inherited_feature] = scoring_result[inherited_feature]
+
+
+def as_completed_step_up_scoring(scoring_result: dict) -> dict:
+    original_reason = scoring_result.get("policy_reason") or "unknown_policy_reason"
+    original_decision = scoring_result.get("decision", "ALLOW")
+    original_factor = scoring_result.get("required_factor", "NONE")
+
+    can_complete_with_totp = (
+        original_decision in {"ALLOW", "STEP_UP_TOTP"}
+        or original_factor in {"NONE", "TOTP_OR_WEBAUTHN", "KEYCLOAK_TOTP"}
+    )
+
+    if not can_complete_with_totp:
+        return {
+            **scoring_result,
+            "policy_reason": f"mfa_step_observed_without_downgrade_after_{original_reason}",
+            "scoring_status": "mfa_step_inherited_recent_login",
+        }
+
+    return {
+        **scoring_result,
+        "decision": "ALLOW",
+        "required_factor": "NONE",
+        "auth_path": "MFA_COMPLETED",
+        "policy_reason": f"adaptive_keycloak_totp_verified_after_{original_reason}",
+        "scoring_status": "mfa_step_inherited_recent_login",
+    }
+
+
+def get_completed_step_up_scoring(context: dict) -> Optional[dict]:
+    scoring_result = get_recent_login_scoring(
+        user_id=context["user_id"],
+        username=context["username"],
+        client_id="",
+        ip=context["ip"],
+        ref_time=context["event_time"],
+        lookback_minutes=STEP_UP_LOGIN_LOOKBACK_MINUTES,
+        exclude_step_up_clients=True,
+    )
+
+    if not scoring_result:
+        return None
+
+    inherit_recent_login_features(context, scoring_result)
+    return as_completed_step_up_scoring(scoring_result)
+
+
 # ============================================================
 # ROUTES
 # ============================================================
@@ -1182,7 +1324,17 @@ async def receive_event(req: Request):
 
     context = build_event_context(data, req, event_type=event_type)
 
-    if event_type in tracked_for_scoring:
+    if event_type == "LOGIN" and is_step_up_client(context["client_id"]):
+        scoring_result = get_completed_step_up_scoring(context)
+        if scoring_result is None:
+            fallback_scoring = score_event(context["scoring_features"])
+            scoring_result = {
+                **fallback_scoring,
+                "policy_reason": f"mfa_step_without_recent_login_{fallback_scoring['policy_reason']}",
+                "scoring_status": "mfa_step_scored_without_recent_login",
+            }
+        row = row_from_context(context, scoring_result)
+    elif event_type in tracked_for_scoring:
         scoring_result = score_event(context["scoring_features"])
         row = row_from_context(context, scoring_result)
     elif event_type == "APP_SESSION_STARTED":
@@ -1195,6 +1347,7 @@ async def receive_event(req: Request):
         )
 
         if scoring_result:
+            inherit_recent_login_features(context, scoring_result)
             scoring_result = {
                 **scoring_result,
                 "scoring_status": "inherited_recent_login",
